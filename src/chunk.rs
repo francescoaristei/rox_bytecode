@@ -1,10 +1,8 @@
-
-/*
-Operation codes for each bytecode instruction.
- */
 use crate::value::{Value, Values};
 
 /*
+Operation codes for each bytecode instruction.
+
 Stored constants need also to be executed as it could be in: print 1;
 The compiled chunk needs therefore to store the constants and know when to execute them.
 The bytecode instruction needs not only the opcode, but also operands (binary data stored
@@ -37,8 +35,16 @@ impl Chunk {
         self.lines.push(line);
     }
 
+    pub fn read(&self, index: &usize) -> u8 {
+        self.code[*index]
+    }
+
     pub fn add_constant(&mut self, value: Value) -> usize {
         self.constants.push_value(value)
+    }
+
+    pub fn get_constant(&self, index: usize) -> &Value {
+        self.constants.get_value(index)
     }
 
     pub fn disassemble_chunk(&self, chunk: &Chunk, name: &str) {
@@ -51,7 +57,7 @@ impl Chunk {
         }
     }
 
-    fn disassemble_instruction(&self, chunk: &Chunk, offset: &mut usize) -> usize {
+    pub fn disassemble_instruction(&self, chunk: &Chunk, offset: &mut usize) -> usize {
         print!("{:04}", offset);
         // a single line of lox source code, can correspond to several bytecode instructions,
         // '|' is used to mark a bytecode instruction that belongs to the same source code line
@@ -76,7 +82,7 @@ impl Chunk {
     fn constant_instruction(&self, name: &str, chunk: &Chunk, offset: &mut usize) -> usize {
         let constant_index = chunk.code[*offset + 1] as usize;
         print!("    {:16} {:4}  ", name, constant_index);
-        chunk.constants.print_value(chunk.constants.get_value(constant_index));
+        chunk.constants.get_value(constant_index).print_value();
         print!("\n");
         *offset += 2;
         *offset

@@ -6,8 +6,17 @@ need to be stored somewhere in the chunks. Where?
 - Save bigger data (strings) in specific memory region of the binary executable called 'constants data'.
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
-pub type Value = f64;
+pub enum Value {
+    Number(f64)
+}
 
+impl Value {
+    pub fn print_value(&self) {
+        match self { 
+            Value::Number(number) => print!("{}", number)
+        }
+    }
+}
 
 pub struct Values {
     values: Vec<Value>
@@ -27,9 +36,5 @@ impl Values {
 
     pub fn get_value(&self, index: usize) -> &Value {
         &self.values[index]
-    }
-
-    pub fn print_value(&self, value: &Value) {
-        print!("{}", value)
     }
 }
