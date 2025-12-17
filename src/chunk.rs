@@ -9,7 +9,12 @@ The bytecode instruction needs not only the opcode, but also operands (binary da
 after the opcode): in this case the address of where the constant is stored in the constants array.
  */
 pub const OP_CONSTANT: u8 = 0;
-pub const OP_RETURN: u8 = 1;
+pub const OP_ADD: u8 = 1;
+pub const OP_SUBTRACT: u8 = 2;
+pub const OP_MULTIPLY: u8 = 3;
+pub const OP_DIVIDE: u8 = 4;
+pub const OP_NEGATE: u8 = 5;
+pub const OP_RETURN: u8 = 6;
 
 /*
 Struct holding the actual bytecode instructions (binary data).
@@ -53,11 +58,11 @@ impl Chunk {
         while offset < chunk.code.len() {
             // instructions have different size (number of bytes) therefore
             // the offset is computed when disassembling the instruction itself.
-            self.disassemble_instruction(chunk, &mut offset);
+            offset = self.disassemble_instruction(chunk, &offset);
         }
     }
 
-    pub fn disassemble_instruction(&self, chunk: &Chunk, offset: &mut usize) -> usize {
+    pub fn disassemble_instruction(&self, chunk: &Chunk, offset: &usize) -> usize {
         print!("{:04}", offset);
         // a single line of lox source code, can correspond to several bytecode instructions,
         // '|' is used to mark a bytecode instruction that belongs to the same source code line
@@ -70,27 +75,29 @@ impl Chunk {
         let byte = chunk.code[*offset];
         match byte {
             OP_CONSTANT => self.constant_instruction("OP_CONSTANT", chunk, offset),
+            OP_NEGATE => self.simple_instruction("OP_NEGATE", offset),
+            OP_ADD => self.simple_instruction("OP_ADD", offset),
+            OP_SUBTRACT => self.simple_instruction("OP_SUBTRACT", offset),
+            OP_MULTIPLY => self.simple_instruction("OP_MULTIPLY", offset),
+            OP_DIVIDE => self.simple_instruction("OP_DIVIDE", offset),
             OP_RETURN => self.simple_instruction("OP_RETURN", offset),
             _ => {
                 println!("Unknown opcode: {}", byte);
-                *offset += 1;
-                *offset
+                *offset + 1
             }
         }
     }
 
-    fn constant_instruction(&self, name: &str, chunk: &Chunk, offset: &mut usize) -> usize {
+    fn constant_instruction(&self, name: &str, chunk: &Chunk, offset: &usize) -> usize {
         let constant_index = chunk.code[*offset + 1] as usize;
         print!("    {:16} {:4}  ", name, constant_index);
         chunk.constants.get_value(constant_index).print_value();
         print!("\n");
-        *offset += 2;
-        *offset
+        *offset + 2
     }
 
-    fn simple_instruction(&self, name: &str, offset: &mut usize) -> usize {
-        print!("    {}", name);
-        *offset += 1;
-        *offset
+    fn simple_instruction(&self, name: &str, offset: &usize) -> usize {
+        println!("    {}", name);
+        *offset + 1
     }
 }

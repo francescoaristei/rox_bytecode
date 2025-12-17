@@ -6,6 +6,11 @@ need to be stored somewhere in the chunks. Where?
 - Save bigger data (strings) in specific memory region of the binary executable called 'constants data'.
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
+use std::fmt::{Display, Formatter};
+
+// TO-DO: later when adding more complex types, use Rc<> only for these complex types, better than using Vec<Rc<Value>> for self.values
+// cloning (actual clone) a f64 or a bool is cheap and correct
+#[derive(Clone)]
 pub enum Value {
     Number(f64)
 }
@@ -14,6 +19,14 @@ impl Value {
     pub fn print_value(&self) {
         match self { 
             Value::Number(number) => print!("{}", number)
+        }
+    }
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Number(number) => write!(f, "{}", number)
         }
     }
 }
