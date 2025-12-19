@@ -6,7 +6,9 @@ use crate::chunk::OP_ADD;
 use crate::chunk::OP_SUBTRACT;
 use crate::chunk::OP_MULTIPLY;
 use crate::chunk::OP_DIVIDE;
+use crate::compiler::{Parser};
 use crate::value::Value;
+use crate::util::disassemble_instruction;
 
 /*
 When having an instruction like: print 3 - 2; in Lox is required to have instructions
@@ -39,12 +41,12 @@ When an instruction produces a value it pushes it in the stack and when it evalu
 pub struct Vm {
     chunk: Chunk,
     ip: usize,
-    stack: Vec<Value>
+    stack: Vec<Value>,
 }
 
 pub enum InterpretResult {
     InterpretOk,
-    InterpretCompileError,
+    InterpretCompilerError,
     InterpretRuntimeError
 }
 
@@ -53,11 +55,20 @@ impl Vm {
         Vm {
             chunk,
             ip: 0,
-            stack: Vec::new()
+            stack: Vec::new(),
         }
     }
 
-    pub fn run(&mut self) -> InterpretResult {
+    pub fn interpret(&mut self, source: String) -> InterpretResult {
+        let mut parser = Parser::new(&source, &mut self.chunk);
+        // compiler takes the empty chunk
+        if !parser.compile() {
+            return InterpretResult::InterpretCompilerError;
+        }
+        self.run()
+    }
+
+    fn run(&mut self) -> InterpretResult {
         loop {
             #[cfg(feature = "debug-trace-execution")]
             {
@@ -67,7 +78,7 @@ impl Vm {
                     print!("[{}]", value);
                 }
                 print!("\n");
-                self.chunk.disassemble_instruction(&self.chunk, &self.ip);
+                disassemble_instruction(&self.chunk, &self.ip);
             }
 
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'

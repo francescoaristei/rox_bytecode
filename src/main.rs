@@ -1,28 +1,65 @@
-use rox_bytecode::chunk::{Chunk, OP_ADD, OP_CONSTANT, OP_DIVIDE, OP_NEGATE, OP_RETURN};
-use rox_bytecode::value::Value;
-use rox_bytecode::vm::Vm;
+use std::{env, fs, io, process};
+use std::io::Write;
+use rox_bytecode::chunk::Chunk;
+use rox_bytecode::vm::{InterpretResult, Vm};
 
 fn main() {
-    let mut chunk = Chunk::new();
-    let constant_1 = chunk.add_constant(Value::Number(1.2));
-    chunk.write(OP_CONSTANT, 123);
-    chunk.write(constant_1 as u8, 123);
+    let args: Vec<String> = env::args().collect();
+    //let file_name = "C:\\Users\\Utente\\RustroverProjects\\rox_bytecode\\src\\temp.lox";
+    //run_file(file_name);
+    if args.len() > 2 {
+        println!("Usage: Rox [script]");
+        process::exit(0);
+    } else if args.len() == 2 {
+        run_file(args[1].as_str());
+    } else {
+        run_prompt();
+    }
+}
 
-    let constant_2 = chunk.add_constant(Value::Number(3.4));
-    chunk.write(OP_CONSTANT, 123);
-    chunk.write(constant_2 as u8, 123);
+fn run_file(path: &str) {
+    match read_file(path) {
+        Ok(source) => {
+            match run(source) {
+                InterpretResult::InterpretCompilerError => process::exit(65),
+                InterpretResult::InterpretRuntimeError => process::exit(70),
+                InterpretResult::InterpretOk => ()
+            }
+        },
+        Err(_) => eprint!("Error reading the file.")
+    }
+}
 
-    chunk.write(OP_ADD, 123);
+fn run_prompt() {
+    loop {
+        print!("> ");
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            // CTRL + Z
+            Ok(0) => break,
+            Ok(_) => {
+                let input = input.trim().to_string();
+                match run(input) {
+                    InterpretResult::InterpretOk => (),
+                    InterpretResult::InterpretCompilerError
+                    | InterpretResult::InterpretRuntimeError => break
+                }
+            },
+            Err(_) => {
+                println!("Error reading line.");
+                break;
+            }
+        }
+    }
+}
 
-    let constant_3 = chunk.add_constant(Value::Number(5.6));
-    chunk.write(OP_CONSTANT, 123);
-    chunk.write(constant_3 as u8, 123);
-
-    chunk.write(OP_DIVIDE, 123);
-
-    chunk.write(OP_NEGATE, 123);
-    chunk.write(OP_RETURN, 123);
-    chunk.disassemble_chunk(&chunk, "test chunk");
+fn run(source: String) -> InterpretResult {
+    let chunk = Chunk::new();
     let mut vm = Vm::new(chunk);
-    vm.run();
+    vm.interpret(source)
+}
+
+fn read_file(path: &str) -> io::Result<String> {
+    fs::read_to_string(path)
 }

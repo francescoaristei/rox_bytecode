@@ -22,7 +22,7 @@ Struct holding the actual bytecode instructions (binary data).
 pub struct Chunk {
     // From the AST nodes defined in the interpreter to these three arrays
     code: Vec<u8>,
-    lines: Vec<u32>, // to store the line number to return in case of runtime error, it parallels the code array
+    lines: Vec<usize>, // to store the line number to return in case of runtime error, it parallels the code array
     constants: Values
 }
 
@@ -34,8 +34,20 @@ impl Chunk {
             constants: Values::new()
         }
     }
+    
+    pub fn get_code(&self) -> &Vec<u8> {
+        &self.code
+    }
+    
+    pub fn get_lines(&self) -> &Vec<usize> {
+        &self.lines
+    }
+    
+    pub fn get_constants(&self) -> &Values {
+        &self.constants
+    }
 
-    pub fn write(&mut self, byte: u8, line: u32) {
+    pub fn write(&mut self, byte: u8, line: usize) {
         self.code.push(byte);
         self.lines.push(line);
     }
@@ -50,54 +62,5 @@ impl Chunk {
 
     pub fn get_constant(&self, index: usize) -> &Value {
         self.constants.get_value(index)
-    }
-
-    pub fn disassemble_chunk(&self, chunk: &Chunk, name: &str) {
-        println!("== {} ==", name);
-        let mut offset = 0;
-        while offset < chunk.code.len() {
-            // instructions have different size (number of bytes) therefore
-            // the offset is computed when disassembling the instruction itself.
-            offset = self.disassemble_instruction(chunk, &offset);
-        }
-    }
-
-    pub fn disassemble_instruction(&self, chunk: &Chunk, offset: &usize) -> usize {
-        print!("{:04}", offset);
-        // a single line of lox source code, can correspond to several bytecode instructions,
-        // '|' is used to mark a bytecode instruction that belongs to the same source code line
-        // of the preceding one.
-        if *offset > 0 && chunk.lines[*offset] == chunk.lines[*offset - 1] {
-            print!("  | ");
-        } else {
-            print!("{:4}", chunk.lines[*offset]);
-        }
-        let byte = chunk.code[*offset];
-        match byte {
-            OP_CONSTANT => self.constant_instruction("OP_CONSTANT", chunk, offset),
-            OP_NEGATE => self.simple_instruction("OP_NEGATE", offset),
-            OP_ADD => self.simple_instruction("OP_ADD", offset),
-            OP_SUBTRACT => self.simple_instruction("OP_SUBTRACT", offset),
-            OP_MULTIPLY => self.simple_instruction("OP_MULTIPLY", offset),
-            OP_DIVIDE => self.simple_instruction("OP_DIVIDE", offset),
-            OP_RETURN => self.simple_instruction("OP_RETURN", offset),
-            _ => {
-                println!("Unknown opcode: {}", byte);
-                *offset + 1
-            }
-        }
-    }
-
-    fn constant_instruction(&self, name: &str, chunk: &Chunk, offset: &usize) -> usize {
-        let constant_index = chunk.code[*offset + 1] as usize;
-        print!("    {:16} {:4}  ", name, constant_index);
-        chunk.constants.get_value(constant_index).print_value();
-        print!("\n");
-        *offset + 2
-    }
-
-    fn simple_instruction(&self, name: &str, offset: &usize) -> usize {
-        println!("    {}", name);
-        *offset + 1
     }
 }
