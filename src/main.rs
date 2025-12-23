@@ -1,7 +1,7 @@
 use std::{env, fs, io, process};
 use std::io::Write;
 use rox_bytecode::chunk::Chunk;
-use rox_bytecode::vm::{InterpretResult, Vm};
+use rox_bytecode::vm::{Error, Vm};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -21,9 +21,13 @@ fn run_file(path: &str) {
     match read_file(path) {
         Ok(source) => {
             match run(source) {
-                InterpretResult::InterpretCompilerError => process::exit(65),
-                InterpretResult::InterpretRuntimeError => process::exit(70),
-                InterpretResult::InterpretOk => ()
+                Ok(()) => (),
+                Err(error) => {
+                    match error {
+                        Error::InterpretCompilerError => process::exit(65),
+                        Error::InterpretRuntimeError => process::exit(70),
+                    }
+                }
             }
         },
         Err(_) => eprint!("Error reading the file.")
@@ -41,9 +45,8 @@ fn run_prompt() {
             Ok(_) => {
                 let input = input.trim().to_string();
                 match run(input) {
-                    InterpretResult::InterpretOk => (),
-                    InterpretResult::InterpretCompilerError
-                    | InterpretResult::InterpretRuntimeError => break
+                    Ok(()) => (),
+                    Err(_) => break
                 }
             },
             Err(_) => {
@@ -54,7 +57,7 @@ fn run_prompt() {
     }
 }
 
-fn run(source: String) -> InterpretResult {
+fn run(source: String) -> Result<(), Error> {
     let chunk = Chunk::new();
     let mut vm = Vm::new(chunk);
     vm.interpret(source)

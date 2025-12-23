@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::rc::Rc;
 use crate::chunk::Chunk;
 use crate::chunk::OP_RETURN;
 use crate::chunk::OP_CONSTANT;
@@ -6,6 +8,13 @@ use crate::chunk::OP_ADD;
 use crate::chunk::OP_SUBTRACT;
 use crate::chunk::OP_MULTIPLY;
 use crate::chunk::OP_DIVIDE;
+use crate::chunk::OP_TRUE;
+use crate::chunk::OP_FALSE;
+use crate::chunk::OP_NIL;
+use crate::chunk::OP_NOT;
+use crate::chunk::OP_EQUAL;
+use crate::chunk::OP_GREATER;
+use crate::chunk::OP_LESS;
 use crate::compiler::{Parser};
 use crate::value::Value;
 use crate::util::disassemble_instruction;
@@ -42,12 +51,21 @@ pub struct Vm {
     chunk: Chunk,
     ip: usize,
     stack: Vec<Value>,
+    globals: HashMap<Rc<String>, Value>
 }
 
-pub enum InterpretResult {
-    InterpretOk,
+pub enum Error {
     InterpretCompilerError,
     InterpretRuntimeError
+}
+
+enum ArithmeticOps {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Greater,
+    Less
 }
 
 impl Vm {
@@ -56,19 +74,20 @@ impl Vm {
             chunk,
             ip: 0,
             stack: Vec::new(),
+            globals: HashMap::new()
         }
     }
 
-    pub fn interpret(&mut self, source: String) -> InterpretResult {
+    pub fn interpret(&mut self, source: String) -> Result<(), Error> {
         let mut parser = Parser::new(&source, &mut self.chunk);
         // compiler takes the empty chunk
         if !parser.compile() {
-            return InterpretResult::InterpretCompilerError;
+            return Err(Error::InterpretCompilerError);
         }
         self.run()
     }
 
-    fn run(&mut self) -> InterpretResult {
+    fn run(&mut self) -> Result<(), Error> {
         loop {
             #[cfg(feature = "debug-trace-execution")]
             {
@@ -89,42 +108,93 @@ impl Vm {
                         top_stack.print_value();
                     }
                     print!("\n");
-                    return InterpretResult::InterpretOk
+                    return Ok(())
                 },
                 OP_NEGATE => {
-                    if let Some(top_stack) = self.stack.pop() {
+                    if let Some(top_stack) = self.peek(0) {
                         match top_stack {
-                            Value::Number(number) => self.stack.push(Value::Number(-number))
+                            Value::Number(number) => {
+                                let value = Value::Number(-number);
+                                self.stack.pop();
+                                self.stack.push(value)
+                            },
+                            _ => return Err(self.runtime_error("Operand must be a number."))
                         }
                     }
                 },
-                OP_ADD => self.binary_op("ADD"),
-                OP_SUBTRACT => self.binary_op("SUB"),
-                OP_MULTIPLY => self.binary_op("MUL"),
-                OP_DIVIDE => self.binary_op("DIV"),
+                OP_ADD => {
+                    if let (Some(a), Some(b)) = (self.peek(0), self.peek(1)) {
+                        match (a, b) {
+                            (Value::String(a_val), Value::String(b_val)) => {
+                                let ab = Value::String(Rc::new(format!("{}{}", b_val, a_val)));
+                                self.stack.pop();
+                                self.stack.pop();
+                                self.stack.push(ab)
+                            },
+                            (Value::Number(_a_val), Value::Number(_b_val)) => self.binary_op(ArithmeticOps::Add)?,
+                            _ => return Err(self.runtime_error("Operands must be two strings or two numbers."))
+                        }
+                    } else {
+                        return Err(self.runtime_error("No values on the stack."))
+                    }
+                },
+                OP_SUBTRACT =>self.binary_op(ArithmeticOps::Subtract)?,
+                OP_MULTIPLY =>self.binary_op(ArithmeticOps::Multiply)?,
+                OP_DIVIDE =>self.binary_op(ArithmeticOps::Divide)?,
+                OP_NOT => {
+                    if let Some(value) = self.stack.pop() {
+                        self.stack.push(Value::Boolean(self.is_falsey(value)))
+                    } else {
+                        return Err(self.runtime_error("No value on the stack."))
+                    }
+                },
                 OP_CONSTANT => {
                     let constant = self.read_constant().clone();
                     self.stack.push(constant);
-                }
+                },
+                OP_FALSE => self.stack.push(Value::Boolean(false)),
+                OP_EQUAL => {
+                    if let (Some(b), Some(a)) = (self.stack.pop(), self.stack.pop()) {
+                        self.stack.push(Value::Boolean(self.values_equal(a, b)));
+                    } else {
+                        return Err(self.runtime_error("No values on the stack."))
+                    }
+                },
+                OP_GREATER => self.binary_op(ArithmeticOps::Greater)?,
+                OP_LESS => self.binary_op(ArithmeticOps::Less)?,
+                OP_TRUE => self.stack.push(Value::Boolean(true)),
+                OP_NIL => self.stack.push(Value::Nil),
                 _ => ()
             }
         }
     }
 
-    fn binary_op(&mut self, operation: &str) {
-        if let (Some(b), Some(a)) = (self.stack.pop(), self.stack.pop()) {
-            match (b, a) {
-                (Value::Number(b), Value::Number(a)) => {
+    fn binary_op(&mut self, operation: ArithmeticOps) -> Result<(), Error> {
+        if let (Some(b_ref), Some(a_ref)) = (self.peek(0), self.peek(1)) {
+            return match (b_ref, a_ref) {
+                (Value::Number(b_ref), Value::Number(a_ref)) => {
+                    let b = *b_ref;
+                    let a = *a_ref;
+                    self.stack.pop();
+                    self.stack.pop();
                     match operation {
-                        "ADD" => self.stack.push(Value::Number(a + b)),
-                        "SUB" => self.stack.push(Value::Number(a - b)),
-                        "MUL" => self.stack.push(Value::Number(a * b)),
-                        "DIV" => self.stack.push(Value::Number(a / b)),
-                        _ => () // TO-DO: ADD ERROR HANDLING
+                        ArithmeticOps::Add => self.stack.push(Value::Number(a + b)),
+                        ArithmeticOps::Subtract => self.stack.push(Value::Number(a - b)),
+                        ArithmeticOps::Multiply => self.stack.push(Value::Number(a * b)),
+                        ArithmeticOps::Divide => self.stack.push(Value::Number(a / b)),
+                        ArithmeticOps::Greater => self.stack.push(Value::Boolean(a > b)),
+                        ArithmeticOps::Less => self.stack.push(Value::Boolean(a < b))
                     }
-                }
+                    Ok(())
+                },
+                _ => Err(self.runtime_error("Operands must be numbers."))
             }
         }
+        Err(self.runtime_error("Not enough values in the stack."))
+    }
+
+    fn peek(&self, distance: usize) -> Option<&Value> {
+        self.stack.get(self.stack.len() - 1 -distance)
     }
 
     fn read_byte(&mut self) -> u8 {
@@ -136,6 +206,31 @@ impl Vm {
     fn read_constant(&mut self) -> &Value {
         let index = self.read_byte() as usize;
         self.chunk.get_constant(index)
+    }
+
+    fn values_equal(&self, a: Value, b: Value) -> bool {
+        match (a, b) {
+            (Value::Number(a_val), Value::Number(b_val)) => a_val == b_val,
+            (Value::Boolean(a_val), Value::Boolean(b_val)) => a_val == b_val,
+            (Value::String(a_val), Value::String(b_val)) => a_val == b_val,
+            (Value::Nil, Value::Nil) => true,
+            (_, _) => false
+        }
+    }
+
+    fn is_falsey(&self, value: Value) -> bool {
+        match value {
+            Value::Boolean(bool) => bool,
+            Value::Nil => false,
+            _ => true
+        }
+    }
+
+    fn runtime_error(&self, messages: &str) -> Error {
+        eprintln!("{}", messages);
+        let line = self.chunk.get_lines()[self.ip - 1];
+        eprintln!("[line: {}] in script", line);
+        Error::InterpretRuntimeError
     }
 }
 

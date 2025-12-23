@@ -7,18 +7,27 @@ need to be stored somewhere in the chunks. Where?
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
 use std::fmt::{Display, Formatter};
-
-// TO-DO: later when adding more complex types, use Rc<> only for these complex types, better than using Vec<Rc<Value>> for self.values
-// cloning (actual clone) a f64 or a bool is cheap and correct
+use std::rc::Rc;
+/*
+The Lox values in memory are stored in two ways:
+ - On the Stack, if the data type is small and immutable.
+ - On the Heap, using a pointer to the starting location to access the data for mutable, large data (String, Objects..).
+ */
 #[derive(Clone)]
 pub enum Value {
-    Number(f64)
+    Number(f64),
+    Boolean(bool),
+    String(Rc<String>),
+    Nil
 }
 
 impl Value {
     pub fn print_value(&self) {
         match self { 
-            Value::Number(number) => print!("{}", number)
+            Value::Number(number) => print!("{}", number),
+            Value::Boolean(bool) => print!("{}", bool),
+            Value::String(string) => print!("{}", string),
+            Value::Nil => print!("nil")
         }
     }
 }
@@ -26,7 +35,10 @@ impl Value {
 impl Display for Value {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Number(number) => write!(f, "{}", number)
+            Value::Number(number) => write!(f, "{}", number),
+            Value::Boolean(bool) => write!(f, "{}", bool),
+            Value::String(string) => write!(f, "{}", string),
+            Value::Nil => write!(f, "nil")
         }
     }
 }

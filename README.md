@@ -62,3 +62,177 @@ The parallel with the Tree-walk interpreter can be represented like this:
         └────────────────┘                └────────────────┘
 
 ```
+
+Why BYTECODE IS BETTER THAN TREE WALK INTERPRETER: NOTES
+
+VEC<> FOR STACK:
+
+How Vec<T> Memory Layout Works
+
+A Vec<T> is actually stored in two places:
+
+The Vec Struct Itself (Metadata)
+
+pub struct Vec<T> {
+ptr: *mut T,      // Pointer to heap buffer
+len: usize,       // Current number of elements
+cap: usize,       // Allocated capacity
+}
+// Size: 24 bytes on 64-bit systems
+
+This metadata lives wherever the Vec is defined.
+
+The Actual Elements (Data)
+
+The elements are always on the heap, accessed through the pointer.
+
+In Your VM
+
+pub struct Vm {
+chunk: Chunk,
+ip: usize,
+stack: Vec<Value>,  // ← Let's analyze this
+}
+
+When you create a VM:
+let mut vm = Vm::new(chunk);
+
+Memory layout:
+Stack:
+┌─────────────────┐
+│ Vm struct       │
+│  - chunk: ...   │
+│  - ip: usize    │
+│  - stack:       │
+│    - ptr   ───────────┐
+│    - len       │      │
+│    - cap       │      │
+└─────────────────┘      │
+│
+Heap:                    │
+┌────────────────────────┘
+│
+▼
+┌─────────────────────────┐
+│ Vec buffer:             │
+│ [Value, Value, Value...] │
+└─────────────────────────┘
+
+- Vm struct: On the stack (local variable)
+- Vec metadata (ptr, len, cap): Inside Vm struct, so also on stack
+- Vec buffer (the actual Value elements): On the heap
+
+Why This Matters
+
+1. Cache Friendliness
+
+The Vec buffer is a contiguous block of heap memory:
+// When you push values:
+vm.stack.push(Value::Number(1.0));
+vm.stack.push(Value::Number(2.0));
+vm.stack.push(Value::Number(3.0));
+
+Memory layout on heap:
+[Value::Number(1.0) | Value::Number(2.0) | Value::Number(3.0)]
+↑ Contiguous, sequential, cache-friendly
+
+This is much better than scattered AST nodes:
+Heap (scattered):
+Address 0x1000: Box(Expr::Literal)
+Address 0x3500: Box(Expr::Binary)
+Address 0x7200: Box(Expr::Literal)
+↑ Random locations, cache-unfriendly
+
+2. Stack Operations Are Fast
+
+let b = self.stack.pop();   // O(1) - just decrement len
+let a = self.stack.pop();   // O(1)
+self.stack.push(result);    // O(1) amortized
+
+All operations just modify:
+- The heap buffer (read/write a single memory location)
+- The length field (increment/decrement)
+
+No pointer chasing, no indirection.
+
+3. Comparison with AST Traversal
+
+Tree-walk (your jlox in Rust):
+// Each Box<Expr> is a separate heap allocation
+fn evaluate(&mut self, expr: Box<Expr>) -> Value {
+match *expr {
+Expr::Binary { left, op, right } => {
+let left = self.evaluate(left);   // ← Dereference Box, jump to random heap location
+let right = self.evaluate(right); // ← Another random heap location
+// ...
+}
+}
+}
+
+Bytecode:
+loop {
+match self.read_byte() {  // ← Sequential bytecode array
+OP_ADD => {
+let b = self.stack.pop();  // ← Sequential stack array
+let a = self.stack.pop();
+self.stack.push(a + b);
+}
+}
+}
+
+WHY BYTECODE MORE EFFICIENT IN MEMORY AND TIME:
+
+Performance Advantages
+
+1. Execution Speed
+
+Tree-walk interpreter (your first implementation):
+fn visit_binary(&mut self, left: Box<Expr>, op: Token, right: Box<Expr>) -> Value {
+let left_val = self.evaluate(*left);   // Recursive call
+let right_val = self.evaluate(*right); // Recursive call
+match op.token_type {
+TokenType::Plus => /* ... */
+}
+}
+- Every operation requires method calls, pattern matching, heap allocations
+- Deeply nested expressions = deep call stack
+- Cache-unfriendly: AST nodes scattered in memory
+
+Bytecode VM:
+loop {
+match self.read_byte() {
+OP_ADD => {
+let b = self.stack.pop();
+let a = self.stack.pop();
+self.stack.push(a + b);
+}
+}
+}
+- Tight loop, sequential memory access
+- Values on stack (Vec), very cache-friendly
+- No recursion overhead
+- ~3-10x faster typically (though Rust narrows this gap vs C)
+
+2. Memory Efficiency
+
+AST representation of 1 + 2 * 3:
+Binary {
+left: Box(Literal(1)),           // ~48+ bytes
+op: Token::Plus,                 // ~32+ bytes  
+right: Box(Binary {              // ~48+ bytes
+left: Box(Literal(2)),       // ~48+ bytes
+op: Token::Star,             // ~32+ bytes
+right: Box(Literal(3))       // ~48+ bytes
+})
+}
+// Total: ~256+ bytes (rough estimate, includes enum tags, padding)
+
+Bytecode representation:
+OP_CONSTANT 0    // 2 bytes (1 + 2 * 3)
+OP_CONSTANT 1    // 2 bytes
+OP_CONSTANT 2    // 2 bytes
+OP_MULTIPLY      // 1 byte
+OP_ADD           // 1 byte
+// Total: 8 bytes of instructions + constant pool
+
+Result: Bytecode is 10-30x more compact than AST in memory.
