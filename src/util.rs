@@ -1,4 +1,4 @@
-use crate::chunk::{Chunk, OP_ADD, OP_CONSTANT, OP_DIVIDE, OP_MULTIPLY, OP_NEGATE, OP_RETURN, OP_SUBTRACT, OP_NIL, OP_TRUE, OP_FALSE, OP_NOT, OP_EQUAL, OP_GREATER, OP_LESS};
+use crate::chunk::{Chunk, OpCode};
 use crate::scanner::{Token, TokenType};
 
 // Error handling
@@ -42,22 +42,27 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &usize) -> usize {
         print!("{:4}", chunk.get_lines()[*offset]);
     }
     let byte = chunk.get_code()[*offset];
-    match byte {
-        OP_CONSTANT => constant_instruction("OP_CONSTANT", chunk, offset),
-        OP_TRUE => simple_instruction("OP_TRUE", offset),
-        OP_FALSE => simple_instruction("OP_FALSE", offset),
-        OP_EQUAL => simple_instruction("OP_EQUAL", offset),
-        OP_GREATER => simple_instruction("OP_GREATER", offset),
-        OP_LESS => simple_instruction("OP_LESS", offset),
-        OP_NIL => simple_instruction("OP_NIL", offset),
-        OP_NEGATE => simple_instruction("OP_NEGATE", offset),
-        OP_ADD => simple_instruction("OP_ADD", offset),
-        OP_SUBTRACT => simple_instruction("OP_SUBTRACT", offset),
-        OP_MULTIPLY => simple_instruction("OP_MULTIPLY", offset),
-        OP_DIVIDE => simple_instruction("OP_DIVIDE", offset),
-        OP_NOT => simple_instruction("OP_NOT", offset),
-        OP_RETURN => simple_instruction("OP_RETURN", offset),
-        _ => {
+    match OpCode::from_u8(byte) {
+        Some(OpCode::OpConstant) => constant_instruction("OP_CONSTANT", chunk, offset),
+        Some(OpCode::OpTrue) => simple_instruction("OP_TRUE", offset),
+        Some(OpCode::OpFalse) => simple_instruction("OP_FALSE", offset),
+        Some(OpCode::OpEqual) => simple_instruction("OP_EQUAL", offset),
+        Some(OpCode::OpGreater) => simple_instruction("OP_GREATER", offset),
+        Some(OpCode::OpLess) => simple_instruction("OP_LESS", offset),
+        Some(OpCode::OpNil) => simple_instruction("OP_NIL", offset),
+        Some(OpCode::OpNegate) => simple_instruction("OP_NEGATE", offset),
+        Some(OpCode::OpAdd) => simple_instruction("OP_ADD", offset),
+        Some(OpCode::OpSubtract) => simple_instruction("OP_SUBTRACT", offset),
+        Some(OpCode::OpMultiply) => simple_instruction("OP_MULTIPLY", offset),
+        Some(OpCode::OpDivide) => simple_instruction("OP_DIVIDE", offset),
+        Some(OpCode::OpNot) => simple_instruction("OP_NOT", offset),
+        Some(OpCode::OpReturn) => simple_instruction("OP_RETURN", offset),
+        Some(OpCode::OpPrint) => simple_instruction("OP_PRINT", offset),
+        Some(OpCode::OpPop) => simple_instruction("OP_POP", offset),
+        Some(OpCode::OpDefineGlobal) => simple_instruction("OP_DEFINE_GLOBAL", offset),
+        Some(OpCode::OpGetGlobal) => constant_instruction("OP_GET_GLOBAL", chunk, offset),
+        Some(OpCode::OpSetGlobal) => constant_instruction("OP_SET_GLOBAL", chunk, offset),
+        None => {
             println!("Unknown opcode: {}", byte);
             *offset + 1
         }

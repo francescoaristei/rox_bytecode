@@ -1,20 +1,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
-use crate::chunk::Chunk;
-use crate::chunk::OP_RETURN;
-use crate::chunk::OP_CONSTANT;
-use crate::chunk::OP_NEGATE;
-use crate::chunk::OP_ADD;
-use crate::chunk::OP_SUBTRACT;
-use crate::chunk::OP_MULTIPLY;
-use crate::chunk::OP_DIVIDE;
-use crate::chunk::OP_TRUE;
-use crate::chunk::OP_FALSE;
-use crate::chunk::OP_NIL;
-use crate::chunk::OP_NOT;
-use crate::chunk::OP_EQUAL;
-use crate::chunk::OP_GREATER;
-use crate::chunk::OP_LESS;
+use crate::chunk::{Chunk, OpCode};
 use crate::compiler::{Parser};
 use crate::value::Value;
 use crate::util::disassemble_instruction;
@@ -102,15 +88,15 @@ impl Vm {
 
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
             let instruction: u8 = self.read_byte();
-            match instruction {
-                OP_RETURN => {
-                    if let Some(top_stack) = self.stack.pop() {
+            match OpCode::from_u8(instruction) {
+                Some(OpCode::OpReturn) => {
+                    /*if let Some(top_stack) = self.stack.pop() {
                         top_stack.print_value();
                     }
-                    print!("\n");
+                    print!("\n");*/
                     return Ok(())
                 },
-                OP_NEGATE => {
+                Some(OpCode::OpNegate) => {
                     if let Some(top_stack) = self.peek(0) {
                         match top_stack {
                             Value::Number(number) => {
@@ -122,9 +108,12 @@ impl Vm {
                         }
                     }
                 },
-                OP_ADD => {
+                Some(OpCode::OpAdd) => {
                     if let (Some(a), Some(b)) = (self.peek(0), self.peek(1)) {
                         match (a, b) {
+                            // THIS NEEDS REFACTORING IN THE FUTURE, BECAUSE THERE IS NO STRING INTERNING
+                            // CONSIDER MOVING THE INTERNING FROM COMPILER.RS TO CHUNK.RS BECAUSE IN THIS WAY
+                            // THE HASHMAP WOULD BE ACCESSIBLE HERE IN THE VM.RS
                             (Value::String(a_val), Value::String(b_val)) => {
                                 let ab = Value::String(Rc::new(format!("{}{}", b_val, a_val)));
                                 self.stack.pop();
@@ -138,33 +127,96 @@ impl Vm {
                         return Err(self.runtime_error("No values on the stack."))
                     }
                 },
-                OP_SUBTRACT =>self.binary_op(ArithmeticOps::Subtract)?,
-                OP_MULTIPLY =>self.binary_op(ArithmeticOps::Multiply)?,
-                OP_DIVIDE =>self.binary_op(ArithmeticOps::Divide)?,
-                OP_NOT => {
+                Some(OpCode::OpSubtract) => self.binary_op(ArithmeticOps::Subtract)?,
+                Some(OpCode::OpMultiply) => self.binary_op(ArithmeticOps::Multiply)?,
+                Some(OpCode::OpDivide) => self.binary_op(ArithmeticOps::Divide)?,
+                Some(OpCode::OpNot) => {
                     if let Some(value) = self.stack.pop() {
                         self.stack.push(Value::Boolean(self.is_falsey(value)))
                     } else {
                         return Err(self.runtime_error("No value on the stack."))
                     }
                 },
-                OP_CONSTANT => {
+                Some(OpCode::OpConstant) => {
                     let constant = self.read_constant().clone();
                     self.stack.push(constant);
                 },
-                OP_FALSE => self.stack.push(Value::Boolean(false)),
-                OP_EQUAL => {
+                Some(OpCode::OpFalse) => self.stack.push(Value::Boolean(false)),
+                Some(OpCode::OpEqual) => {
                     if let (Some(b), Some(a)) = (self.stack.pop(), self.stack.pop()) {
                         self.stack.push(Value::Boolean(self.values_equal(a, b)));
                     } else {
                         return Err(self.runtime_error("No values on the stack."))
                     }
                 },
-                OP_GREATER => self.binary_op(ArithmeticOps::Greater)?,
-                OP_LESS => self.binary_op(ArithmeticOps::Less)?,
-                OP_TRUE => self.stack.push(Value::Boolean(true)),
-                OP_NIL => self.stack.push(Value::Nil),
-                _ => ()
+                Some(OpCode::OpPrint) => {
+                    /*
+                    At the time the interpreter reaches this point, the expression contained in the 'print' has already
+                    been compiled and the result of the expression pushed on the stack.
+                    An interesting thing to notice is that the Stack Effect of statements is zero, meaning that once the
+                    statement has finished is net effect on the stack (values added to it) is zero differently from expression
+                    which have a Stack Effect of one, regardless of how complex that expression is.
+                     */
+                    if let Some(stack_value) = self.stack.pop() {
+                        stack_value.print_value();
+                        print!("\n");
+                    } else {
+                        return Err(self.runtime_error("No value on the stack."))
+                    }
+                },
+                Some(OpCode::OpGetGlobal) => {
+                    let name = self.read_constant().clone();
+                    match name {
+                        Value::String(value) => {
+                            if let Some(global_var) = self.globals.get(&value) {
+                                self.stack.push(global_var.clone());
+                            } else {
+                                return Err(self.runtime_error(format!("undefined variable {}", value).as_str()))
+                            }
+                        },
+                        _ => return Err(self.runtime_error("Variable name must be a string"))
+                    }
+                },
+                Some(OpCode::OpDefineGlobal) => {
+                    let constant = self.read_constant().clone();
+                    match constant {
+                        Value::String(value) => {
+                            if let Some(top_stack) = self.peek(0) {
+                                self.globals.insert(value, top_stack.clone());
+                                self.stack.pop();
+                            } else {
+                                return Err(self.runtime_error("No value on the stack"));
+                            }
+                        },
+                        _ => return Err(self.runtime_error("Variable name must be a string"))
+                    }
+                },
+                Some(OpCode::OpSetGlobal) => {
+                    let constant = self.read_constant().clone();
+                    match constant {
+                        Value::String(value) => {
+                            if let Some(top_stack) = self.peek(0) {
+                                if self.globals.get(&value).is_none() {
+                                    // in cases like:
+                                    // variable1 = "something"
+                                    // where variable1 has never been defined before e.g never done: var variable1;
+                                    return Err(self.runtime_error(format!("Undefined variable: {}", value).as_str()))
+                                } else {
+                                    self.globals.insert(value, top_stack.clone());
+                                }
+                            } else {
+                                return Err(self.runtime_error("No value on the stack"));
+                            }
+                        },
+                        _ => return Err(self.runtime_error("Variable name must be a string"))
+                    }
+                },
+                Some(OpCode::OpPop) => { self.stack.pop(); },
+                Some(OpCode::OpGreater) => self.binary_op(ArithmeticOps::Greater)?,
+                Some(OpCode::OpLess) => self.binary_op(ArithmeticOps::Less)?,
+                Some(OpCode::OpTrue) => self.stack.push(Value::Boolean(true)),
+                Some(OpCode::OpNil) => self.stack.push(Value::Nil),
+                None => ()
             }
         }
     }
@@ -212,7 +264,7 @@ impl Vm {
         match (a, b) {
             (Value::Number(a_val), Value::Number(b_val)) => a_val == b_val,
             (Value::Boolean(a_val), Value::Boolean(b_val)) => a_val == b_val,
-            (Value::String(a_val), Value::String(b_val)) => a_val == b_val,
+            (Value::String(a_val), Value::String(b_val)) => Rc::ptr_eq(&a_val, &b_val),
             (Value::Nil, Value::Nil) => true,
             (_, _) => false
         }

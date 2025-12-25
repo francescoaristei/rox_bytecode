@@ -6,6 +6,7 @@ need to be stored somewhere in the chunks. Where?
 - Save bigger data (strings) in specific memory region of the binary executable called 'constants data'.
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 /*

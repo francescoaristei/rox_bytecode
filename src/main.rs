@@ -5,16 +5,16 @@ use rox_bytecode::vm::{Error, Vm};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    //let file_name = "C:\\Users\\Utente\\RustroverProjects\\rox_bytecode\\src\\temp.lox";
-    //run_file(file_name);
-    if args.len() > 2 {
+    let file_name = "C:\\Users\\Utente\\RustroverProjects\\rox_bytecode\\src\\temp.lox";
+    run_file(file_name);
+    /*if args.len() > 2 {
         println!("Usage: Rox [script]");
         process::exit(0);
     } else if args.len() == 2 {
         run_file(args[1].as_str());
     } else {
         run_prompt();
-    }
+    }*/
 }
 
 fn run_file(path: &str) {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
-use crate::chunk::{Chunk, OP_ADD, OP_CONSTANT, OP_DIVIDE, OP_FALSE, OP_MULTIPLY, OP_NEGATE, OP_NIL, OP_RETURN, OP_SUBTRACT, OP_TRUE, OP_NOT, OP_GREATER, OP_EQUAL, OP_LESS};
+use crate::chunk::{Chunk, OpCode};
+use crate::compiler::Precedence::PrecedenceAssignment;
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
 use crate::util::disassemble_chunk;
@@ -41,7 +42,7 @@ impl Precedence {
 
 // this represents the function used to compile the expression represented by a token given by the Scanner:
 // for example for TokenType::Minus obtained from -a.b the function self.unary() is associated.
-type ParseFn<'a> = fn(&mut Parser<'a>);
+type ParseFn<'a> = fn(&mut Parser<'a>, can_assign: bool);
 
 // this is the building block which creates the association (TokenType, function) that allows to parse/compile the expression
 // that a certain TokenType represents.
@@ -79,6 +80,7 @@ pub struct Parser<'a> {
     previous: Token<'a>,
     compiling_chunk: &'a mut Chunk,
     rules: HashMap<TokenType, ParseRule<'a>>,
+    strings: HashMap<String, Rc<String>>,
     had_error: bool,
     panic_mode: bool
 }
@@ -105,7 +107,7 @@ impl<'a> Parser<'a> {
         rules_map.insert(TokenType::GreaterEqual, ParseRule::new(None, Some(Parser::binary), Precedence::PrecedenceComparison));
         rules_map.insert(TokenType::Less, ParseRule::new(None, Some(Parser::binary), Precedence::PrecedenceComparison));
         rules_map.insert(TokenType::LessEqual, ParseRule::new(None, Some(Parser::binary), Precedence::PrecedenceComparison));
-        rules_map.insert(TokenType::Identifier, ParseRule::new(None, None, Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::Identifier, ParseRule::new(Some(Parser::variable), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::String, ParseRule::new(Some(Parser::string), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Number, ParseRule::new(Some(Parser::number), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::And, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -133,17 +135,91 @@ impl<'a> Parser<'a> {
             previous: Token::new("previous"),
             compiling_chunk: chunk,
             rules: rules_map,
+            strings: HashMap::new(),
             had_error: false,
             panic_mode: false
         }
     }
-
+    
     pub fn compile(&mut self) -> bool {
         self.advance();
-        self.expression();
+        while !self.match_token_type(TokenType::Eof) {
+            self.declaration();
+        }
+        //self.expression();
         self.consume(TokenType::Eof, "Expect end of expression.");
         self.end_compiler();
         !self.had_error
+    }
+
+    fn declaration(&mut self) {
+        if self.match_token_type(TokenType::Var) {
+            self.var_declaration();
+        } else {
+            self.statement();
+        }
+        if self.panic_mode {
+            self.synchronize();
+        }
+    }
+
+    fn var_declaration(&mut self) {
+        let global = self.parse_variable("Expect variable name");
+
+        if self.match_token_type(TokenType::Equal) {
+            self.expression();
+        } else {
+            self.emit_byte(OpCode::OpNil.to_u8());
+        }
+        self.consume(TokenType::Semicolon, "Expected ';' after variable declaration.");
+        self.define_variable(global);
+    }
+
+    fn statement(&mut self) {
+        if self.match_token_type(TokenType::Print) {
+            self.print_statement();
+        } else {
+            self.expression_statement();
+        }
+    }
+
+    /*
+    An expression followed by the ';', it is used to use an expression where a statement
+    is expected.
+    The expression is evaluated and the result is discarded: OP_POP pops the top value of the stack
+    the expression has produced.
+     */
+    fn expression_statement(&mut self) {
+        self.expression();
+        self.consume(TokenType::Semicolon, "Expected ';' after value.");
+        self.emit_byte(OpCode::OpPop.to_u8());
+    }
+
+    fn print_statement(&mut self) {
+        self.expression();
+        self.consume(TokenType::Semicolon, "Expected ';' after value.");
+        self.emit_byte(OpCode::OpPrint.to_u8());
+    }
+
+    fn parse_variable(&mut self, msg: &str) -> u8 {
+        self.consume(TokenType::Identifier, msg);
+        self.identifier_constant()
+    }
+
+    fn identifier_constant(&mut self) -> u8 {
+        // String interning
+        let lexeme = self.previous.get_lexeme();
+        let interned_identifier = self.intern_string(lexeme);
+        self.make_constant(Value::String(interned_identifier))
+    }
+
+    /*
+    The bytecode interpreter loop in the VM needs access to global variables by name,
+    storing it in the bytecode instructions is too expensive, therefore the variable name
+    is saved in the constants of the chunk and the index in the constants vec is used to access it.
+     */
+    fn define_variable(&mut self, index: u8) {
+        self.emit_bytes(OpCode::OpDefineGlobal.to_u8(), index)
     }
 
     /*
@@ -155,7 +231,7 @@ impl<'a> Parser<'a> {
         self.parse_precedence(Precedence::PrecedenceAssignment);
     }
 
-    fn unary(&mut self) {
+    fn unary(&mut self, can_assign: bool) {
         let token_type = self.previous.get_token_type();
 
         /*
@@ -167,15 +243,48 @@ impl<'a> Parser<'a> {
         self.parse_precedence(Precedence::PrecedenceUnary);
 
         match token_type {
-            TokenType::Minus => self.emit_byte(OP_NEGATE),
-            TokenType::Bang => self.emit_byte(OP_NOT),
+            TokenType::Minus => self.emit_byte(OpCode::OpNegate.to_u8()),
+            TokenType::Bang => self.emit_byte(OpCode::OpNot.to_u8()),
             _ => unreachable!()
         }
     }
 
-    fn string(&mut self) {
+    fn string(&mut self, can_assign: bool) {
         let lexeme = self.previous.get_lexeme();
-        self.emit_constant(Value::String(Rc::new(lexeme[1..lexeme.len() - 1].to_string())))
+        let interned_string = self.intern_string(&lexeme[1..lexeme.len() - 1]);
+        self.emit_constant(Value::String(interned_string));
+    }
+
+    fn intern_string(&mut self, lexeme: &str) -> Rc<String> {
+        if let Some(value) = self.strings.get(lexeme) {
+            value.clone()
+        } else {
+            let value = Rc::new(lexeme.to_string());
+            self.strings.insert(lexeme.to_string(), value.clone());
+            value
+        }
+    }
+
+    fn variable(&mut self, can_assign: bool) {
+        self.named_variable(can_assign);
+    }
+
+    fn named_variable(&mut self, can_assign: bool) {
+        let arg = self.identifier_constant();
+        /*
+        The bytecode compiler is a single-pass compiler, meaning
+        it reads the source code and immediately emits bytecode.
+        In cases like: menu.branch(sunday).beverage = "something";
+        we need to understand if the expression menu.branch(sunday).beverage
+        refers to a getter or a setter. To do so, is sufficient to check that
+        there is an equal sign '=' after the trailing identifier: 'beverage'.
+         */
+        if can_assign && self.match_token_type(TokenType::Equal) {
+            self.expression();
+            self.emit_bytes(OpCode::OpSetGlobal.to_u8(), arg)
+        } else {
+            self.emit_bytes(OpCode::OpGetGlobal.to_u8(), arg);
+        }
     }
 
     /*
@@ -183,12 +292,12 @@ impl<'a> Parser<'a> {
     but it does not have a runtime semantic meaning for the backend, therefore no bytecode is emitted for it, but only for
     the expression within it.
      */
-    fn grouping(&mut self) {
+    fn grouping(&mut self, can_assign: bool) {
         self.expression();
         self.consume(TokenType::RightParen, "Expect ')' after expression");
     }
 
-    fn number(&mut self) {
+    fn number(&mut self, can_assign: bool) {
         let value: f64 = self.previous.
             get_lexeme()
             .parse()
@@ -203,7 +312,7 @@ impl<'a> Parser<'a> {
     The VM will execute the left and right operands on the stack and then the instruction for the operator: it will pop the two values
     from the stack, execute the operation and push the result on the stack.
      */
-    fn binary(&mut self) {
+    fn binary(&mut self, can_assign: bool) {
         // at the time binary() is called, the infix operator has been consumed and is in the self.previous token
         let operator_type = self.previous.get_token_type();
         let parse_rule = self.get_rule(&operator_type);
@@ -211,25 +320,25 @@ impl<'a> Parser<'a> {
         self.parse_precedence(Precedence::next(precedence));
         match operator_type {
             // a != b is equal to !(a == b)
-            TokenType::BangEqual => self.emit_bytes(OP_EQUAL, OP_NOT),
-            TokenType::EqualEqual => self.emit_byte(OP_EQUAL),
-            TokenType::Greater => self.emit_byte(OP_GREATER),
-            TokenType::GreaterEqual => self.emit_bytes(OP_LESS, OP_NOT),
-            TokenType::Less => self.emit_byte(OP_LESS),
-            TokenType::LessEqual => self.emit_bytes(OP_GREATER, OP_NOT),
-            TokenType::Plus => self.emit_byte(OP_ADD),
-            TokenType::Minus => self.emit_byte(OP_SUBTRACT),
-            TokenType::Star => self.emit_byte(OP_MULTIPLY),
-            TokenType::Slash => self.emit_byte(OP_DIVIDE),
+            TokenType::BangEqual => self.emit_bytes(OpCode::OpEqual.to_u8(), OpCode::OpNot.to_u8()),
+            TokenType::EqualEqual => self.emit_byte(OpCode::OpEqual.to_u8()),
+            TokenType::Greater => self.emit_byte(OpCode::OpGreater.to_u8()),
+            TokenType::GreaterEqual => self.emit_bytes(OpCode::OpLess.to_u8(), OpCode::OpNot.to_u8()),
+            TokenType::Less => self.emit_byte(OpCode::OpLess.to_u8()),
+            TokenType::LessEqual => self.emit_bytes(OpCode::OpGreater.to_u8(), OpCode::OpNot.to_u8()),
+            TokenType::Plus => self.emit_byte(OpCode::OpAdd.to_u8()),
+            TokenType::Minus => self.emit_byte(OpCode::OpSubtract.to_u8()),
+            TokenType::Star => self.emit_byte(OpCode::OpMultiply.to_u8()),
+            TokenType::Slash => self.emit_byte(OpCode::OpDivide.to_u8()),
             _ => unreachable!()
         }
     }
 
-    fn literal(&mut self) {
+    fn literal(&mut self, can_assign: bool) {
         match self.previous.get_token_type() {
-            TokenType::False => self.emit_byte(OP_FALSE),
-            TokenType::True => self.emit_byte(OP_TRUE),
-            TokenType::Nil => self.emit_byte(OP_NIL),
+            TokenType::False => self.emit_byte(OpCode::OpFalse.to_u8()),
+            TokenType::True => self.emit_byte(OpCode::OpTrue.to_u8()),
+            TokenType::Nil => self.emit_byte(OpCode::OpNil.to_u8()),
             _ => unreachable!()
         }
     }
@@ -438,11 +547,35 @@ impl<'a> Parser<'a> {
         let token_type = self.previous.get_token_type();
         let prefix_rule = self.get_rule(&token_type).prefix;
 
+        /*
+        Assignment is the lowest precedence expression, therefore is allowed only when
+        parsing assignment expressions or top-level expressions like expression statements.
+        Otherwise, expressions like a * b = c + d would be parsed as a * (b = c + d), indeed:
+        - First, parsePrecedence() parses a using the variable() prefix parser.
+        - After that, it enters the infix parsing loop.
+        - It reaches the * and calls binary().
+        - That recursively calls parsePrecedence() to parse the right-hand operand.
+        - That calls variable() again for parsing b.
+        - Inside that call to variable(), it looks for a trailing =.
+        - It sees one and thus parses the rest of the line as an assignment.
+         */
+        let can_assign = precedence <= PrecedenceAssignment;
+
+
         if let Some(prefix) = prefix_rule {
-            prefix(self);
+            prefix(self, can_assign);
         } else {
             self.error("Expect expression.");
             return;
+        }
+
+        /*
+        The example made above: a * b = c + d is actually a syntax error, a * b is not a valid identifier,
+        therefore such kind of assignment needs to be reported as an error.
+        The following helps us understand if we tried to do something like that.
+         */
+        if can_assign && self.match_token_type(TokenType::Equal) {
+            self.error("Invalid assignment target.");
         }
 
         /*
@@ -456,7 +589,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let infix_rule = self.get_rule(&self.previous.get_token_type()).infix.unwrap();
             // the infix operator consume the right token and compile to the bytecode for its operation.
-            infix_rule(self);
+            infix_rule(self, can_assign);
         }
     }
 
@@ -464,7 +597,7 @@ impl<'a> Parser<'a> {
     // to push the code in the stack at runtime.
     fn emit_constant(&mut self, value: Value) {
         let index = self.make_constant(value);
-        self.emit_bytes(OP_CONSTANT, index)
+        self.emit_bytes(OpCode::OpConstant.to_u8(), index)
     }
 
     // compiles a number literal to bytecode
@@ -490,7 +623,7 @@ impl<'a> Parser<'a> {
     }
 
     fn emit_return(&mut self) {
-        self.emit_byte(OP_RETURN);
+        self.emit_byte(OpCode::OpReturn.to_u8());
     }
 
     // for writing OP_CODE + operand
@@ -528,6 +661,44 @@ impl<'a> Parser<'a> {
         self.error_at_current(message)
     }
 
+    fn match_token_type(&mut self, token_type: TokenType) -> bool {
+        if !self.check(token_type) {
+            return false;
+        }
+        self.advance();
+        true
+    }
+
+    fn check(&self, token_type: TokenType) -> bool {
+        self.current.get_token_type() == token_type
+    }
+
+    /*
+    If in the previous statement a compile-time error has been hit, in the current one, everything is discarded
+    until a statement boundary: The end of the statement (semicolon) or the start of the following statement (control flow or declaration)
+     */
+    fn synchronize(&mut self) {
+        self.panic_mode = false;
+
+        while self.current.get_token_type() != TokenType::Eof {
+            if self.previous.get_token_type() == TokenType::Semicolon {
+                return;
+            }
+            match self.current.get_token_type() {
+                TokenType::Class |
+                TokenType::Fun   |
+                TokenType::Var   |
+                TokenType::For   |
+                TokenType::If    |
+                TokenType::While |
+                TokenType::Print |
+                TokenType::Return => return,
+                _ => ()
+            }
+            self.advance();
+        }
+    }
+
     fn error_at_current(&mut self, message: &str) {
         self.error_at(self.current, message);
     }
@@ -544,11 +715,11 @@ impl<'a> Parser<'a> {
         self.panic_mode = true;
         eprint!("[line {}] Error", token.get_line());
         match token.get_token_type() {
-            TokenType::Eof => eprint!("at end."),
+            TokenType::Eof => eprint!(" at end"),
             TokenType::Error => (),
             _ => eprint!("at {}", token.get_lexeme())
         }
-        eprint!(":{}", message);
+        eprint!(": {}", message);
         self.had_error = true;
     }
 }

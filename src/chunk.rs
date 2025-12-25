@@ -8,20 +8,60 @@ The compiled chunk needs therefore to store the constants and know when to execu
 The bytecode instruction needs not only the opcode, but also operands (binary data stored
 after the opcode): in this case the address of where the constant is stored in the constants array.
  */
-pub const OP_CONSTANT: u8 = 0;
-pub const OP_NIL: u8 = 1;
-pub const OP_TRUE: u8 = 2;
-pub const OP_FALSE: u8 = 3;
-pub const OP_EQUAL: u8 = 4;
-pub const OP_GREATER: u8 = 5;
-pub const OP_LESS: u8 = 6;
-pub const OP_ADD: u8 = 7;
-pub const OP_SUBTRACT: u8 = 8;
-pub const OP_MULTIPLY: u8 = 9;
-pub const OP_DIVIDE: u8 = 10;
-pub const OP_NOT: u8 = 11;
-pub const OP_NEGATE: u8 = 12;
-pub const OP_RETURN: u8 = 13;
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpCode {
+    OpConstant = 0,
+    OpNil = 1,
+    OpTrue = 2,
+    OpFalse = 3,
+    OpPop = 4,
+    OpGetGlobal = 5,
+    OpDefineGlobal = 6,
+    OpSetGlobal = 7,
+    OpEqual = 8,
+    OpGreater = 9,
+    OpLess = 10,
+    OpAdd = 11,
+    OpSubtract = 12,
+    OpMultiply = 13,
+    OpDivide = 14,
+    OpNot = 15,
+    OpNegate = 16,
+    OpPrint = 17,
+    OpReturn = 18
+}
+
+impl OpCode {
+    pub fn from_u8(byte: u8) -> Option<OpCode> {
+        match byte {
+            0 => Some(OpCode::OpConstant),
+            1 => Some(OpCode::OpNil),
+            2 => Some(OpCode::OpTrue),
+            3 => Some(OpCode::OpFalse),
+            4 => Some(OpCode::OpPop),
+            5 => Some(OpCode::OpGetGlobal),
+            6 => Some(OpCode::OpDefineGlobal),
+            7 => Some(OpCode::OpSetGlobal),
+            8 => Some(OpCode::OpEqual),
+            9 => Some(OpCode::OpGreater),
+            10 => Some(OpCode::OpLess),
+            11 => Some(OpCode::OpAdd),
+            12 => Some(OpCode::OpSubtract),
+            13 => Some(OpCode::OpMultiply),
+            14 => Some(OpCode::OpDivide),
+            15 => Some(OpCode::OpNot),
+            16 => Some(OpCode::OpNegate),
+            17 => Some(OpCode::OpPrint),
+            18 => Some(OpCode::OpReturn),
+            _ => None
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
 
 /*
 Struct holding the actual bytecode instructions (binary data).
