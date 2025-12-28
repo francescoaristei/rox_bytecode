@@ -236,3 +236,146 @@ OP_ADD           // 1 byte
 // Total: 8 bytes of instructions + constant pool
 
 Result: Bytecode is 10-30x more compact than AST in memory.
+
+
+
+> My question is, in case of local variables, how can I access the identifier for a certain variable? like a for var a? If the set puts in the stack in the position where 'a'
+is expected its value, where I have access to the actual identnfier of the variable?
+
+● Excellent question! This reveals the key insight of how local variables work.
+
+The Answer: You Don't Need the Identifier at Runtime!
+
+The variable name (like "a") is only needed during compilation. At runtime, the VM never sees or uses the name - it only uses the slot number.
+
+Where the Identifier Lives
+
+At Compile Time
+
+compiler.rs:93-105:
+struct Local<'a> {
+name: Token<'a>,      // ← The identifier "a" is HERE
+depth: Option<usize>
+}
+
+The compiler maintains compiler.locals: Vec<Local>, which stores:
+- locals[0].name = Token("a")
+- locals[1].name = Token("b")
+- etc.
+
+When You Write a = 5
+
+Step 1: Compiler sees identifier "a"
+
+compiler.rs:468-480 (resolve_local):
+fn resolve_local(&mut self) -> Option<u8> {
+// Search through all locals
+for i in self.compiler.local_count - 1..0 {
+if let Some(local) = self.compiler.locals.get(i as usize) {
+// Compare the identifier we're looking up with stored names
+if std::ptr::eq(local.name.get_lexeme(), self.previous.get_lexeme()) {
+//            ^^^^^^^^^^^^^^^^^^^^      ^^^^^^^^^^^^^^^^^^^^^^^^
+//            stored name "a"           current identifier "a"
+if local.depth.is_none() {
+self.error("Can't read local variable in its own initializer.");
+}
+return Some(i);  // ← Returns 0 (the slot number)
+}
+}
+}
+None
+}
+
+Step 2: Compiler emits bytecode with only the slot number:
+OpConstant 5
+OpSetLocal 0    ← Just the number 0, not the name "a"!
+
+At Runtime - The Name Disappears!
+
+vm.rs:224-230:
+Some(OpCode::OpSetLocal) => {
+let slot = self.read_byte();  // Reads 0 from bytecode
+// No access to "a" - we only have the number 0!
+self.stack[slot as usize] = self.peek(0).expect("...").clone();
+}
+
+The VM never knows the variable was called "a". It just knows "slot 0".
+
+Visual Timeline
+
+┌─────────────────────────────────────────────────────────────┐
+│ COMPILE TIME                                                 │
+├─────────────────────────────────────────────────────────────┤
+│ Source code: var a = 1;                                     │
+│                                                              │
+│ Compiler state:                                             │
+│   compiler.locals = [                                       │
+│     Local { name: Token("a"), depth: Some(1) }              │
+│   ]                                                          │
+│                                                              │
+│ When seeing: a = 5                                          │
+│   1. resolve_local() searches locals by name                │
+│   2. Finds "a" at index 0                                   │
+│   3. Emits: OpSetLocal 0  ← Only the index!                 │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ RUNTIME                                                      │
+├─────────────────────────────────────────────────────────────┤
+│ Bytecode: OpSetLocal 0                                      │
+│                                                              │
+│ VM state:                                                   │
+│   stack = [1, 2, 5]                                         │
+│   (no variable names stored!)                               │
+│                                                              │
+│ Execution:                                                  │
+│   1. Read slot = 0 from bytecode                            │
+│   2. stack[0] = stack.top()  // stack[0] = 5                │
+│   3. Done! Never needed the name "a"                        │
+└─────────────────────────────────────────────────────────────┘
+
+Why This Works
+
+The compiler does the "name → slot number" translation once during compilation. By the time the code runs, all variable references have been converted to slot numbers.
+
+Compile-time mapping:
+
+"a" → slot 0
+"b" → slot 1
+"c" → slot 2
+
+Runtime bytecode (no names!):
+
+OpGetLocal 0    // Not "OpGetLocal a"
+OpSetLocal 1    // Not "OpSetLocal b"
+
+Contrast with Global Variables
+
+| Aspect                  | Local Variables         | Global Variables               |
+  |-------------------------|-------------------------|--------------------------------|
+| Name stored at runtime? | ❌ No                   | ✅ Yes (in HashMap)            |
+| Bytecode operand        | Slot number (u8)        | Index to constant table → name |
+| Runtime lookup          | stack[slot]             | globals.get(name)              |
+| Speed                   | Very fast (array index) | Slower (hash lookup)           |
+
+Global Variable Example:
+
+// Compile time for: globalVar = 5
+OpConstant 5
+OpSetGlobal 0    // 0 = index in constant table
+// constants[0] = String("globalVar")
+
+// Runtime
+Some(OpCode::OpSetGlobal) => {
+let name_index = self.read_byte();  // 0
+let name = self.read_constant();     // String("globalVar")
+// Now we have the name and can do: globals.insert(name, value)
+}
+
+Summary
+
+Where is the identifier "a"?
+- Compile time: In compiler.locals[0].name
+- Runtime: Nowhere! It's been compiled away to just the number 0
+
+This is what makes local variables fast - the name resolution happens once during compilation, then at runtime it's just array indexing with no string comparisons or hash lookups needed.

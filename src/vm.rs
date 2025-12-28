@@ -97,34 +97,28 @@ impl Vm {
                     return Ok(())
                 },
                 Some(OpCode::OpNegate) => {
-                    if let Some(top_stack) = self.peek(0) {
-                        match top_stack {
-                            Value::Number(number) => {
-                                let value = Value::Number(-number);
-                                self.stack.pop();
-                                self.stack.push(value)
-                            },
-                            _ => return Err(self.runtime_error("Operand must be a number."))
-                        }
+                    match self.peek(0) {
+                        Value::Number(number) => {
+                            let value = Value::Number(-number);
+                            self.stack.pop();
+                            self.stack.push(value)
+                        },
+                        _ => return Err(self.runtime_error("Operand must be a number."))
                     }
                 },
                 Some(OpCode::OpAdd) => {
-                    if let (Some(a), Some(b)) = (self.peek(0), self.peek(1)) {
-                        match (a, b) {
-                            // THIS NEEDS REFACTORING IN THE FUTURE, BECAUSE THERE IS NO STRING INTERNING
-                            // CONSIDER MOVING THE INTERNING FROM COMPILER.RS TO CHUNK.RS BECAUSE IN THIS WAY
-                            // THE HASHMAP WOULD BE ACCESSIBLE HERE IN THE VM.RS
-                            (Value::String(a_val), Value::String(b_val)) => {
-                                let ab = Value::String(Rc::new(format!("{}{}", b_val, a_val)));
-                                self.stack.pop();
-                                self.stack.pop();
-                                self.stack.push(ab)
-                            },
-                            (Value::Number(_a_val), Value::Number(_b_val)) => self.binary_op(ArithmeticOps::Add)?,
-                            _ => return Err(self.runtime_error("Operands must be two strings or two numbers."))
-                        }
-                    } else {
-                        return Err(self.runtime_error("No values on the stack."))
+                    match (self.peek(0), self.peek(1)) {
+                        // THIS NEEDS REFACTORING IN THE FUTURE, BECAUSE THERE IS NO STRING INTERNING
+                        // CONSIDER MOVING THE INTERNING FROM COMPILER.RS TO CHUNK.RS BECAUSE IN THIS WAY
+                        // THE HASHMAP WOULD BE ACCESSIBLE HERE IN THE VM.RS
+                        (Value::String(a_val), Value::String(b_val)) => {
+                            let ab = Value::String(Rc::new(format!("{}{}", b_val, a_val)));
+                            self.stack.pop();
+                            self.stack.pop();
+                            self.stack.push(ab)
+                        },
+                        (Value::Number(_a_val), Value::Number(_b_val)) => self.binary_op(ArithmeticOps::Add)?,
+                        _ => return Err(self.runtime_error("Operands must be two strings or two numbers."))
                     }
                 },
                 Some(OpCode::OpSubtract) => self.binary_op(ArithmeticOps::Subtract)?,
@@ -177,16 +171,21 @@ impl Vm {
                         _ => return Err(self.runtime_error("Variable name must be a string"))
                     }
                 },
+                Some(OpCode::OpGetLocal) => {
+                    /*
+                    When the OP_GET_LOCAL is executed, on the stack has been pushed the byte representing the index in the stack
+                    where the local variable value is.
+                    This index, is the same of the local variable name in the self.compiler.locals for the parser.
+                     */
+                    let slot = self.read_byte();
+                    self.stack.push(self.stack[slot as usize].clone())
+                },
                 Some(OpCode::OpDefineGlobal) => {
                     let constant = self.read_constant().clone();
                     match constant {
                         Value::String(value) => {
-                            if let Some(top_stack) = self.peek(0) {
-                                self.globals.insert(value, top_stack.clone());
-                                self.stack.pop();
-                            } else {
-                                return Err(self.runtime_error("No value on the stack"));
-                            }
+                            self.globals.insert(value, self.peek(0).clone());
+                            self.stack.pop();
                         },
                         _ => return Err(self.runtime_error("Variable name must be a string"))
                     }
@@ -195,21 +194,24 @@ impl Vm {
                     let constant = self.read_constant().clone();
                     match constant {
                         Value::String(value) => {
-                            if let Some(top_stack) = self.peek(0) {
-                                if self.globals.get(&value).is_none() {
-                                    // in cases like:
-                                    // variable1 = "something"
-                                    // where variable1 has never been defined before e.g never done: var variable1;
-                                    return Err(self.runtime_error(format!("Undefined variable: {}", value).as_str()))
-                                } else {
-                                    self.globals.insert(value, top_stack.clone());
-                                }
+                            if self.globals.get(&value).is_none() {
+                                // in cases like:
+                                // variable1 = "something"
+                                // where variable1 has never been defined before e.g never done: var variable1;
+                                return Err(self.runtime_error(format!("Undefined variable: {}", value).as_str()))
                             } else {
-                                return Err(self.runtime_error("No value on the stack"));
+                                self.globals.insert(value, self.peek(0).clone());
                             }
                         },
                         _ => return Err(self.runtime_error("Variable name must be a string"))
                     }
+                },
+                Some(OpCode::OpSetLocal) => {
+                    /*
+                    In the same way, the cell of the stack at position slot needs to be equal to the top of the stack
+                     */
+                    let slot = self.read_byte();
+                    self.stack[slot as usize] = self.peek(0).clone();
                 },
                 Some(OpCode::OpPop) => { self.stack.pop(); },
                 Some(OpCode::OpGreater) => self.binary_op(ArithmeticOps::Greater)?,
@@ -222,31 +224,28 @@ impl Vm {
     }
 
     fn binary_op(&mut self, operation: ArithmeticOps) -> Result<(), Error> {
-        if let (Some(b_ref), Some(a_ref)) = (self.peek(0), self.peek(1)) {
-            return match (b_ref, a_ref) {
-                (Value::Number(b_ref), Value::Number(a_ref)) => {
-                    let b = *b_ref;
-                    let a = *a_ref;
-                    self.stack.pop();
-                    self.stack.pop();
-                    match operation {
-                        ArithmeticOps::Add => self.stack.push(Value::Number(a + b)),
-                        ArithmeticOps::Subtract => self.stack.push(Value::Number(a - b)),
-                        ArithmeticOps::Multiply => self.stack.push(Value::Number(a * b)),
-                        ArithmeticOps::Divide => self.stack.push(Value::Number(a / b)),
-                        ArithmeticOps::Greater => self.stack.push(Value::Boolean(a > b)),
-                        ArithmeticOps::Less => self.stack.push(Value::Boolean(a < b))
-                    }
-                    Ok(())
-                },
-                _ => Err(self.runtime_error("Operands must be numbers."))
-            }
+        return match (self.peek(0), self.peek(1)) {
+            (Value::Number(b_ref), Value::Number(a_ref)) => {
+                let b = *b_ref;
+                let a = *a_ref;
+                self.stack.pop();
+                self.stack.pop();
+                match operation {
+                    ArithmeticOps::Add => self.stack.push(Value::Number(a + b)),
+                    ArithmeticOps::Subtract => self.stack.push(Value::Number(a - b)),
+                    ArithmeticOps::Multiply => self.stack.push(Value::Number(a * b)),
+                    ArithmeticOps::Divide => self.stack.push(Value::Number(a / b)),
+                    ArithmeticOps::Greater => self.stack.push(Value::Boolean(a > b)),
+                    ArithmeticOps::Less => self.stack.push(Value::Boolean(a < b))
+                }
+                Ok(())
+            },
+            _ => Err(self.runtime_error("Operands must be numbers."))
         }
-        Err(self.runtime_error("Not enough values in the stack."))
     }
 
-    fn peek(&self, distance: usize) -> Option<&Value> {
-        self.stack.get(self.stack.len() - 1 -distance)
+    fn peek(&self, distance: usize) -> &Value {
+        &self.stack[self.stack.len() - 1 -distance]
     }
 
     fn read_byte(&mut self) -> u8 {

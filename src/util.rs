@@ -62,11 +62,21 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &usize) -> usize {
         Some(OpCode::OpDefineGlobal) => simple_instruction("OP_DEFINE_GLOBAL", offset),
         Some(OpCode::OpGetGlobal) => constant_instruction("OP_GET_GLOBAL", chunk, offset),
         Some(OpCode::OpSetGlobal) => constant_instruction("OP_SET_GLOBAL", chunk, offset),
+        Some(OpCode::OpSetLocal) => byte_instruction("OP_SET_LOCAL", chunk, offset),
+        Some(OpCode::OpGetLocal) => byte_instruction("OP_GET_LOCAL", chunk, offset),
         None => {
             println!("Unknown opcode: {}", byte);
             *offset + 1
         }
     }
+}
+
+fn byte_instruction(name: &str, chunk: &Chunk, offset: &usize) -> usize {
+    // local variables never leave the compiler to make it to the chunk therefore we show only the slot
+    let slot = chunk.get_code()[offset + 1];
+    print!("    {:16} {:4}  ", name, slot);
+    print!("\n");
+    *offset + 2
 }
 
 fn constant_instruction(name: &str, chunk: &Chunk, offset: &usize) -> usize {

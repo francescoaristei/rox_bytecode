@@ -69,6 +69,58 @@ impl<'a> ParseRule<'a> {
 }
 
 /*
+Local variables are resolved at compile time using the stack.
+The stack is used to store temporary variables needed to compute expressions.
+Statements don't interfere with expressions, therefore is safe to store local variables there.
+Statements (blocks and function bodies in this case) are nested and when a block ends the local variables defined within it go out of scope
+as well, therefore the stack fits as natural data structure to save local variables.
+{
+var a = 1;
+    {
+    var b = 2;
+        {
+        var c = 3
+        }
+    }
+}
+stack: a
+stack: b    a
+stack  c    b   a
+stack: b    a
+stack  a
+To resolve the local variables, we will emit a bytecode instruction with operand the position in the stack of the local variables.
+ */
+struct Local<'a> {
+    name: Token<'a>,
+    depth: Option<usize>
+}
+
+impl<'a> Local<'a> {
+    fn new(name: Token<'a>, depth: Option<usize>) -> Self {
+        Local {
+            name,
+            depth
+        }
+    }
+}
+
+struct Compiler<'a> {
+    locals: Vec<Local<'a>>,
+    local_count: u8,
+    scope_depth: usize // number of blocks surrounding the current code we are compiling.
+}
+
+impl<'a> Compiler<'a> {
+    fn new() -> Self {
+        Compiler {
+            locals: Vec::new(),
+            local_count: 0,
+            scope_depth: 0
+        }
+    }
+}
+
+/*
  Compiler used to obtain (from the user source code) the bytecode that the Virtual Machine will then interpret.
  Is a single pass compiler, meaning it parses the code (consume tokens etc) and produces the bytecode, rather than
  parsing the code to produce the AST and then use the AST for bytecode generation.
@@ -81,6 +133,7 @@ pub struct Parser<'a> {
     compiling_chunk: &'a mut Chunk,
     rules: HashMap<TokenType, ParseRule<'a>>,
     strings: HashMap<String, Rc<String>>,
+    compiler: Box<Compiler<'a>>,
     had_error: bool,
     panic_mode: bool
 }
@@ -136,6 +189,7 @@ impl<'a> Parser<'a> {
             compiling_chunk: chunk,
             rules: rules_map,
             strings: HashMap::new(),
+            compiler: Box::new(Compiler::new()),
             had_error: false,
             panic_mode: false
         }
@@ -178,9 +232,23 @@ impl<'a> Parser<'a> {
     fn statement(&mut self) {
         if self.match_token_type(TokenType::Print) {
             self.print_statement();
+        } else if self.match_token_type(TokenType::LeftBrace) {
+            self.begin_scope();
+            self.block();
+            self.end_scope();
         } else {
             self.expression_statement();
         }
+    }
+
+    fn block(&mut self) {
+        // while the block is not closed (or EOF is reached, in which case there is a malformed block)
+        // keep compiling the statements within the block.
+        while !self.check(TokenType::RightBrace) && !self.check(TokenType::Eof) {
+            self.declaration();
+        }
+
+        self.consume(TokenType::RightBrace, "Expect '}' after the block.")
     }
 
     /*
@@ -203,6 +271,16 @@ impl<'a> Parser<'a> {
 
     fn parse_variable(&mut self, msg: &str) -> u8 {
         self.consume(TokenType::Identifier, msg);
+
+        self.declare_variable();
+        /*
+        At runtime locals are not looked up by name, the variable name
+        does not need to be stuffed in the constant table.
+         */
+        if self.compiler.scope_depth > 0 {
+            return 0;
+        }
+
         self.identifier_constant()
     }
 
@@ -219,7 +297,77 @@ impl<'a> Parser<'a> {
     is saved in the constants of the chunk and the index in the constants vec is used to access it.
      */
     fn define_variable(&mut self, index: u8) {
+        /*
+        No need to create a local variable at runtime (emitting bytecode).
+        The VM has already executed the code to initialize the variable and the
+        value is on top of the stack:
+          {
+            var a = 1 + 2;
+            var b = 4;
+           }
+         stack: OP_CONSTANT 1
+         stack: OP_CONSTANT 1   2
+         stack: OP_ADD      3 // can be used to define local var a
+         stack: OP_CONSTANT 3   4 // can be used to define local var b
+         */
+        if self.compiler.scope_depth > 0 {
+            self.mark_initialized();
+            return
+        }
+
         self.emit_bytes(OpCode::OpDefineGlobal.to_u8(), index)
+    }
+
+    fn mark_initialized(&mut self) {
+        /* Once the variable has declared and its initializer defined, it becomes available for use (defined).
+        To avoid cases like:
+        {
+          var a = "outer";
+          {
+            var a = a;
+          }
+        }
+         */
+        let index = self.compiler.local_count - 1;
+        self.compiler.locals[index as usize].depth = Some(self.compiler.scope_depth);
+    }
+
+    fn declare_variable(&mut self) {
+        // if global scope return
+        // global variables are late bound: meaning
+        // they are resolved at runtime.
+        if self.compiler.scope_depth == 0 {
+            return
+        }
+
+        let name = self.previous;
+        for i in self.compiler.local_count - 1..0 {
+            let local_depth = self.compiler.locals[i as usize].depth;
+            let local_name = self.compiler.locals[i as usize].name;
+            if local_depth.is_some() && local_depth.expect("Variable has not been defined.") < self.compiler.scope_depth {
+                break;
+            }
+            if std::ptr::eq(name.get_lexeme(), local_name.get_lexeme()) {
+                self.error("Already a variable with this name in this scope.");
+            }
+        }
+        self.add_local(name);
+    }
+
+    /*
+    Add the local variable in the compiler list of variables for the current scope.
+     */
+    fn add_local(&mut self, name: Token<'a>) {
+        // The instructions to work with local variables refer to them by the index in the locals
+        // the index is compiled as a bytecode operand, therefore we cannot address more than what a u8
+        // is able to encode.
+        if self.compiler.local_count == u8::MAX + 1 {
+            self.error("Too many local variables in the function.");
+            return;
+        }
+        let local = Local::new(name, None);
+        self.compiler.local_count += 1;
+        self.compiler.locals.push(local);
     }
 
     /*
@@ -270,7 +418,20 @@ impl<'a> Parser<'a> {
     }
 
     fn named_variable(&mut self, can_assign: bool) {
-        let arg = self.identifier_constant();
+        let get_op: u8;
+        let set_op: u8;
+
+        let mut arg = self.resolve_local();
+
+        if arg.is_some() {
+            get_op = OpCode::OpGetLocal.to_u8();
+            set_op = OpCode::OpSetLocal.to_u8();
+        } else {
+            arg = Some(self.identifier_constant());
+            get_op = OpCode::OpGetGlobal.to_u8();
+            set_op = OpCode::OpSetGlobal.to_u8();
+        }
+
         /*
         The bytecode compiler is a single-pass compiler, meaning
         it reads the source code and immediately emits bytecode.
@@ -279,12 +440,43 @@ impl<'a> Parser<'a> {
         refers to a getter or a setter. To do so, is sufficient to check that
         there is an equal sign '=' after the trailing identifier: 'beverage'.
          */
+        let arg_value = arg.expect("No value resolved.");
         if can_assign && self.match_token_type(TokenType::Equal) {
             self.expression();
-            self.emit_bytes(OpCode::OpSetGlobal.to_u8(), arg)
+            self.emit_bytes(set_op, arg_value)
         } else {
-            self.emit_bytes(OpCode::OpGetGlobal.to_u8(), arg);
+            self.emit_bytes(get_op, arg_value);
         }
+    }
+
+    /*
+    The trick is a 1 to 1 matching between the index of a local variable added in self.compiler.locals
+    and the index of the value for that local variable in self.stack in the Vm struct.
+    In fact, when a local variable is declared, we add it in the self.compiler.locals,
+    the value for that local variable is in the stack according to this:
+       {
+        var a = 1 + 2;
+        var b = 4;
+       }
+     stack: OP_CONSTANT 1
+     stack: OP_CONSTANT 1   2
+     stack: OP_ADD      3 // can be used to define local var a
+     stack: OP_CONSTANT 3   4 // can be used to define local var b
+    NOTE: The values on the stack needed to resolve an expression are pushed and popped in the expression lifetime, therefore they
+    don't interfere with the index of the value for that variable in the stack.
+     */
+    fn resolve_local(&mut self) -> Option<u8> {
+        for i in self.compiler.local_count - 1..0 {
+            if let Some(local) = self.compiler.locals.get(i as usize) {
+                if std::ptr::eq(local.name.get_lexeme(), self.previous.get_lexeme()) {
+                    if local.depth.is_none() {
+                        self.error("Can't read local variable in its own initializer.");
+                    }
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     /*
@@ -344,7 +536,24 @@ impl<'a> Parser<'a> {
     }
 
     fn get_rule(&mut self, operator_type: &TokenType) -> &ParseRule<'a> {
-        self.rules.get(operator_type).unwrap()
+        &self.rules[operator_type]
+    }
+
+    fn begin_scope(&mut self) {
+        self.compiler.scope_depth += 1;
+    }
+
+    fn end_scope(&mut self) {
+        self.compiler.scope_depth -= 1;
+        self.compiler.scope_depth -= 1;
+        let mut local_depth = &self.compiler.locals[self.compiler.local_count as usize];
+        while self.compiler.local_count > 0 &&
+            self.compiler.scope_depth < local_depth.depth.expect("Local depth is not initialized.") {
+            // local variables values occupy slots in the stack so when it goes out of scope the value is popped
+            self.emit_byte(OpCode::OpPop.to_u8());
+            self.compiler.local_count -= 1;
+            local_depth = &self.compiler.locals[self.compiler.local_count as usize];
+        }
     }
 
     /*
