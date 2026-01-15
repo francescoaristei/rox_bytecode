@@ -31,7 +31,10 @@ pub enum OpCode {
     OpNot = 17,
     OpNegate = 18,
     OpPrint = 19,
-    OpReturn = 20
+    OpJumpIfFalse = 20,
+    OpJump = 21,
+    OpLoop = 22,
+    OpReturn = 23
 }
 
 impl OpCode {
@@ -57,7 +60,10 @@ impl OpCode {
             17 => Some(OpCode::OpNot),
             18 => Some(OpCode::OpNegate),
             19 => Some(OpCode::OpPrint),
-            20 => Some(OpCode::OpReturn),
+            20 => Some(OpCode::OpJumpIfFalse),
+            21 => Some(OpCode::OpJump),
+            22 => Some(OpCode::OpLoop),
+            23 => Some(OpCode::OpReturn),
             _ => None
         }
     }
@@ -88,6 +94,10 @@ impl Chunk {
     
     pub fn get_code(&self) -> &Vec<u8> {
         &self.code
+    }
+    
+    pub fn set_code(&mut self, index: usize, value: u8) {
+        self.code[index] = value;
     }
     
     pub fn get_lines(&self) -> &Vec<usize> {

@@ -163,7 +163,7 @@ impl<'a> Parser<'a> {
         rules_map.insert(TokenType::Identifier, ParseRule::new(Some(Parser::variable), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::String, ParseRule::new(Some(Parser::string), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Number, ParseRule::new(Some(Parser::number), None, Precedence::PrecedenceNone));
-        rules_map.insert(TokenType::And, ParseRule::new(None, None, Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::And, ParseRule::new(None, Some(Parser::and), Precedence::PrecedenceAnd));
         rules_map.insert(TokenType::Class, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Else, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::False, ParseRule::new(Some(Parser::literal), None, Precedence::PrecedenceNone));
@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
         rules_map.insert(TokenType::Fun, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::If, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Nil, ParseRule::new(Some(Parser::literal), None, Precedence::PrecedenceNone));
-        rules_map.insert(TokenType::Or, ParseRule::new(None, None, Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::Or, ParseRule::new(None, Some(Parser::or), Precedence::PrecedenceOr));
         rules_map.insert(TokenType::Print, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Return, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Super, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -232,6 +232,12 @@ impl<'a> Parser<'a> {
     fn statement(&mut self) {
         if self.match_token_type(TokenType::Print) {
             self.print_statement();
+        } else if self.match_token_type(TokenType::For) {
+            self.for_statement();
+        } else if self.match_token_type(TokenType::If) {
+            self.if_statement();
+        } else if self.match_token_type(TokenType::While) {
+            self.while_statement();
         } else if self.match_token_type(TokenType::LeftBrace) {
             self.begin_scope();
             self.block();
@@ -239,6 +245,175 @@ impl<'a> Parser<'a> {
         } else {
             self.expression_statement();
         }
+    }
+
+    /*
+    * How the if is implemented by the compiler?
+    * Basically we have the instruction pointer (ip) which is used
+    * to know which current instruction to execute in the bytecode.
+    * All that control flow is about is to change the value of the instruction pointer
+    * to point to the instruction to execute depending on the result of the control flow statement
+    * (in this case of the if expression).
+    * The overall branch logic for the if-else is the following:
+    *
+    * condition_expression
+    * OP_JUMP_IF_FALSE ** --->
+    * OP_POP
+    * then_branch
+    * OP_JUMP *** --->
+    * ** --> OP_POP
+    * else_branch
+    *  *** ---> remaining program
+    *
+     */
+    fn if_statement(&mut self) {
+        // first the expression to evaluate is consumed and put on the top of the stack
+        self.consume(TokenType::LeftParen, "Expect '(' after if.");
+        self.expression();
+        self.consume(TokenType::RightParen, "Expect ')' after condition.");
+
+        let then_jump = self.emit_jump(OpCode::OpJumpIfFalse.to_u8());
+        /*
+        * The if is a statement, as such it should leave 0 effects on the stack
+        * hence, the if condition needs to be cleaned from the stack.
+        * If the condition is true, it is popped right after is evaluated.
+         */
+        self.emit_byte(OpCode::OpPop.to_u8());
+        self.statement();
+
+        /*
+        * In case the then_branch is executed and there is an else branch, it is required
+        * to jump after the else branch, otherwise the result would be to execute the then_branch
+        * because the if condition holds true, and then to execute also the else branch, which should instead
+        * be skipped.
+         */
+        let else_jump = self.emit_jump(OpCode::OpJump.to_u8());
+
+        self.patch_jump(then_jump);
+        // if the if condition is false, it is popped right before the else.
+        self.emit_byte(OpCode::OpPop.to_u8());
+
+        if self.match_token_type(TokenType::Else) {
+            self.statement();
+        }
+        // if there is no else statement, the jump will point to the next instruction after the then_branch
+        self.patch_jump(else_jump);
+    }
+
+    /*
+    * The logic behind the while loop is that after the expression, a OP_JUMP_IF_FALSE
+    * is emitted which has patch_jump right after the body of the while, so that if
+    * the expression of the while loop is false, we jump straight after it.
+    * Is also required to jump back. To do that, the position in the bytecode just before
+    * the while condition is evaluated is saved in the loop_start variable, which is then
+    * used to emit the LOOP instruction via the emit_loop utility function.
+    *
+    * It is interesting how from the VM perspective a LOOP operation
+    * or an IF operation are both just changing the value of the
+    * instruction pointer conditionally
+     */
+    fn while_statement(&mut self) {
+        let loop_start = self.current_chunk().get_code().len();
+        // first the expression to evaluate is consumed and put on the top of the stack
+        self.consume(TokenType::LeftParen, "Expect '(' after while.");
+        self.expression();
+        self.consume(TokenType::RightParen, "Expect ')' after condition.");
+
+        let exit_jump = self.emit_jump(OpCode::OpJumpIfFalse.to_u8());
+        self.emit_byte(OpCode::OpPop.to_u8());
+
+        self.statement();
+        self.emit_loop(loop_start);
+
+        self.patch_jump(exit_jump);
+        self.emit_byte(OpCode::OpPop.to_u8());
+    }
+
+    /*
+    * initializer clause
+    * **** --> condition_expression
+    *
+    * OP_JUMP_IF_FALSE ** --->
+    * OP_POP
+    * OP_JUMP *** -->
+    *
+    * ***** --> increment expression
+    *
+    * OP_POP
+    * OP_LOOP **** -->
+    *
+    * *** --> body_statement
+    *
+    * OP_LOOP ***** -->
+    * ** --> OP_POP
+    *
+     */
+    fn for_statement(&mut self) {
+        // if in the for variables are declared they need to be in their scope.
+        self.begin_scope();
+
+        self.consume(TokenType::LeftParen, "Expect '(' after for.");
+        // initializer
+        if self.match_token_type(TokenType::Semicolon) {
+            // do nothing
+        } else if self.match_token_type(TokenType::Var) {
+            self.var_declaration();
+        } else {
+            // expression_statement looks for semicolon (which here is needed)
+            // and emits OP_POP which is also needed to not have the initializer leave anything on the stack
+            self.expression_statement()
+        }
+        let mut loop_start = self.current_chunk().get_code().len();
+
+        let mut exit_jump = -1;
+        // if the condition is omitted we look for a semicolon, if there is no semicolon
+        // it means that the condition is not omitted, hence there must be a self.expression()
+        if !self.match_token_type(TokenType::Semicolon) {
+            self.expression();
+            self.consume(TokenType::Semicolon, "Expected ';' after loop condition");
+
+            // if the condition is false we must jump after the for loop
+            exit_jump = self.emit_jump(OpCode::OpJumpIfFalse.to_u8()) as i32;
+            self.emit_byte(OpCode::OpPop.to_u8());
+        }
+
+        /*
+        * Increment clause
+        * The increment appears before the body of the loop, but executes after.
+        * Since the bytecode compiler does a single pass over the code, the logic is
+        * to jump over the increment, execute the body and then jump back at it before
+        * the next iteration.
+        * The logic is that we jump directly to the body of the for loop with body_jump
+        * then the increment expression is evaluated, which puts the expression value (the increment)
+        * on the top of the stack and then given that is needed only as side effect its value is popped.
+        * Then the idea is to emit_loop() to jump back to the start of the next for loop iteration right before
+        * the loop condition, but then change the loop_start value, which gives the offset of the ip
+        * where the emit_loop() jumps, with the start of the increment.
+        * This way when the emit_loop() is emitted after the body of the for loop, we jump to the
+        * increment instead and execute it.
+        *
+         */
+        if !self.match_token_type(TokenType::RightParen) { // increment clause is optional, if not there is the closing parenthesis
+            let body_jump = self.emit_jump(OpCode::OpJump.to_u8()); // this is the OP_JUMP in the schema above jumping to the body statement
+            let increment_start = self.current_chunk().get_code().len();
+            self.expression();
+            self.emit_byte(OpCode::OpPop.to_u8());
+            self.consume(TokenType::RightParen, "Expect ')' after for clauses.");
+
+            self.emit_loop(loop_start);
+            loop_start = increment_start;
+            self.patch_jump(body_jump);
+        }
+
+        self.statement();
+        self.emit_loop(loop_start);
+
+        if exit_jump != -1 {
+            self.patch_jump(exit_jump as usize);
+            self.emit_byte(OpCode::OpPop.to_u8());
+        }
+
+        self.end_scope();
     }
 
     fn block(&mut self) {
@@ -341,13 +516,13 @@ impl<'a> Parser<'a> {
         }
 
         let name = self.previous;
-        for i in self.compiler.local_count - 1..0 {
+        for i in (0..self.compiler.local_count).rev() {
             let local_depth = self.compiler.locals[i as usize].depth;
             let local_name = self.compiler.locals[i as usize].name;
             if local_depth.is_some() && local_depth.expect("Variable has not been defined.") < self.compiler.scope_depth {
                 break;
             }
-            if std::ptr::eq(name.get_lexeme(), local_name.get_lexeme()) {
+            if name.get_lexeme() == local_name.get_lexeme() {
                 self.error("Already a variable with this name in this scope.");
             }
         }
@@ -361,7 +536,7 @@ impl<'a> Parser<'a> {
         // The instructions to work with local variables refer to them by the index in the locals
         // the index is compiled as a bytecode operand, therefore we cannot address more than what a u8
         // is able to encode.
-        if self.compiler.local_count == u8::MAX + 1 {
+        if self.compiler.local_count == u8::MAX {
             self.error("Too many local variables in the function.");
             return;
         }
@@ -377,6 +552,58 @@ impl<'a> Parser<'a> {
     fn expression(&mut self) {
         // compile the lowest precedence expression, which in turn will compile also all the higher level ones contained within it.
         self.parse_precedence(Precedence::PrecedenceAssignment);
+    }
+
+    /*
+    * In logical operators like AND, if the left expression
+    * is false, there is no point in evaluating the right-hand side
+    * and we should return immediately keeping on the stack the left-hand side
+    * expression. In case instead is needed to evaluate the right-hand side
+    * the left-hand side is discarded from the stack.
+    *
+    * left operand expression
+    * OP_JUMP_IF_FALSE ** --->
+    * OP_POP
+    * right operand expression
+    * ** ---> remaining program
+    *
+     */
+    fn and(&mut self, can_assign: bool) {
+        // here the left-hand side of the expression
+
+        let end_jump = self.emit_jump(OpCode::OpJumpIfFalse.to_u8());
+
+        self.emit_byte(OpCode::OpPop.to_u8());
+
+        // right-hand side of the expression
+        self.parse_precedence(Precedence::PrecedenceAnd);
+
+        self.patch_jump(end_jump);
+    }
+
+    /*
+    * Basically if the left-hand side expression is false,
+    * we jump directly at the right-hand side expression
+    * while if it is true, we jump to OP_JUMP which jumps
+    * after the right-hand side expression because the OR will
+    * be for sure true.
+    *
+    * left operand expression
+    * OP_JUMP_IF_FALSE ** --->
+    * OP_JUMP *** -->
+    * --> ** right operand expression
+    * *** ---> remaining program
+    *
+     */
+    fn or(&mut self, can_assign: bool) {
+        let else_jump = self.emit_jump(OpCode::OpJumpIfFalse.to_u8());
+        let end_jump = self.emit_jump(OpCode::OpJump.to_u8());
+
+        self.patch_jump(else_jump);
+        self.emit_byte(OpCode::OpPop.to_u8());
+
+        self.parse_precedence(Precedence::PrecedenceOr);
+        self.patch_jump(end_jump);
     }
 
     fn unary(&mut self, can_assign: bool) {
@@ -466,9 +693,9 @@ impl<'a> Parser<'a> {
     don't interfere with the index of the value for that variable in the stack.
      */
     fn resolve_local(&mut self) -> Option<u8> {
-        for i in self.compiler.local_count - 1..0 {
+        for i in (0..self.compiler.local_count).rev() {
             if let Some(local) = self.compiler.locals.get(i as usize) {
-                if std::ptr::eq(local.name.get_lexeme(), self.previous.get_lexeme()) {
+                if local.name.get_lexeme() == self.previous.get_lexeme() {
                     if local.depth.is_none() {
                         self.error("Can't read local variable in its own initializer.");
                     }
@@ -545,15 +772,67 @@ impl<'a> Parser<'a> {
 
     fn end_scope(&mut self) {
         self.compiler.scope_depth -= 1;
-        self.compiler.scope_depth -= 1;
-        let mut local_depth = &self.compiler.locals[self.compiler.local_count as usize];
-        while self.compiler.local_count > 0 &&
-            self.compiler.scope_depth < local_depth.depth.expect("Local depth is not initialized.") {
+        while self.compiler.local_count > 0 {
+            let local = &self.compiler.locals[(self.compiler.local_count - 1) as usize];
+            if local.depth.expect("Local depth is not initialized.") <= self.compiler.scope_depth {
+                break;
+            }
             // local variables values occupy slots in the stack so when it goes out of scope the value is popped
             self.emit_byte(OpCode::OpPop.to_u8());
             self.compiler.local_count -= 1;
-            local_depth = &self.compiler.locals[self.compiler.local_count as usize];
+            self.compiler.locals.pop();
         }
+    }
+
+    /*
+    * The OP_JUMP_IF_FALSE bytecode instruction takes also an operand: the offset
+    * of how much to jump with the instruction pointer to start the instruction
+    * following the then_branch (which in case the control flow expression if false is not executed).
+    * However, at the time the OP_JUMP_IF_FALSE byte is emitted, the then branch has not been compiled
+    * therefore, is not known how much to jump with the instruction pointer.
+    * This is solved through the technique called 'backpatching'.
+    * Basically, a placeholder is put in place of the operand following OP_JUMP_IF_FALSE which is then
+    * filled with the correct value of how much to jump, once the then branch has been compiled.
+    * Is required to remember where the OP_JUMP_IF_FALSE is in order to jump back to it and add the correct offset.
+     */
+    fn emit_jump(&mut self, bytecode: u8) -> usize {
+        self.emit_byte(bytecode);
+        // two bytes for the offset operand, e.g 16 bites: 65535 bytes we can jump to.
+        self.emit_byte(0xff);
+        self.emit_byte(0xff);
+        self.current_chunk().get_code().len() - 2 // offset of first operand byte
+    }
+
+    fn patch_jump(&mut self, offset: usize) {
+        /*
+        * The idea is that when arriving here, the then_branch part has already been compiled
+        * as for example in the case of the if_statement() this function is called after self.statement().
+        * At this point to understand how much to jump (how many bytecodes the then_branch takes) you need
+        * to subtract the offset passed, which is the offset of the OP_JUMP_IF_FALSE bytecode instruction in case of
+        * the if minus 2 because after the OP_JUMP_IF_FALSE there are two bytes to make room for the operand
+        * of how much to jump.
+         */
+        let jump = self.current_chunk().get_code().len() - offset - 2;
+
+        match jump > u16::MAX as usize {
+            true => self.error("Too much code to jump over."),
+            false => {
+                self.current_chunk().set_code(offset, ((jump >> 8) & 0xff) as u8);
+                self.current_chunk().set_code(offset + 1, (jump & 0xff) as u8);
+            }
+        }
+    }
+
+    fn emit_loop(&mut self, loop_start: usize) {
+        self.emit_byte(OpCode::OpLoop.to_u8());
+
+        let offset = self.current_chunk().get_code().len() - loop_start + 2;
+        if offset as u16 > u16::MAX {
+            self.error("Loop body too large.");
+        }
+
+        self.emit_byte(((offset >> 8) & 0xff) as u8);
+        self.emit_byte((offset & 0xff) as u8);
     }
 
     /*

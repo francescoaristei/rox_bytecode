@@ -213,6 +213,24 @@ impl Vm {
                     let slot = self.read_byte();
                     self.stack[slot as usize] = self.peek(0).clone();
                 },
+                Some(OpCode::OpJumpIfFalse) => {
+                    let offset = self.read_short();
+                    // if the if condition is false, the ip is updated to proceed to the next instruction
+                    // after the then_branch
+                    if self.is_falsey(self.peek(0).clone()) {
+                        self.ip += offset as usize;
+                    }
+                },
+                Some(OpCode::OpJump) => {
+                    let offset = self.read_short();
+                    // it is an unconditional jump
+                    self.ip += offset as usize;
+                },
+                Some(OpCode::OpLoop) => {
+                    let offset = self.read_short();
+                    // loop means going backward so we decrease
+                    self.ip -= offset as usize;
+                },
                 Some(OpCode::OpPop) => { self.stack.pop(); },
                 Some(OpCode::OpGreater) => self.binary_op(ArithmeticOps::Greater)?,
                 Some(OpCode::OpLess) => self.binary_op(ArithmeticOps::Less)?,
@@ -254,6 +272,14 @@ impl Vm {
         bytecode
     }
 
+    fn read_short(&mut self) -> u16 {
+        let first_byte = self.chunk.read(&self.ip);
+        self.ip += 1;
+        let second_byte = self.chunk.read(&self.ip);
+        self.ip += 1;
+        (first_byte | second_byte) as u16
+    }
+
     fn read_constant(&mut self) -> &Value {
         let index = self.read_byte() as usize;
         self.chunk.get_constant(index)
@@ -271,9 +297,9 @@ impl Vm {
 
     fn is_falsey(&self, value: Value) -> bool {
         match value {
-            Value::Boolean(bool) => bool,
-            Value::Nil => false,
-            _ => true
+            Value::Boolean(b) => !b,
+            Value::Nil => true,
+            _ => false
         }
     }
 

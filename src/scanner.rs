@@ -161,7 +161,7 @@ impl<'a> Scanner<'a> {
                     return match self.source.as_bytes()[self.start + 1] {
                         b'a' => self.check_keyword(2, 3, "lse", TokenType::False),
                         b'o' => self.check_keyword(2, 1, "r", TokenType::For),
-                        b'u' => self.check_keyword(2, 1, "lse", TokenType::Fun),
+                        b'u' => self.check_keyword(2, 1, "n", TokenType::Fun),
                         _ => TokenType::Identifier
                     };
                 }
@@ -176,8 +176,8 @@ impl<'a> Scanner<'a> {
             b't' => {
                 if self.current - self.start > 1 {
                     return match self.source.as_bytes()[self.start + 1] {
-                        b'h' => self.check_keyword(2, 2, "his", TokenType::This),
-                        b'r' => self.check_keyword(2, 2, "rue", TokenType::True),
+                        b'h' => self.check_keyword(2, 2, "is", TokenType::This),
+                        b'r' => self.check_keyword(2, 2, "ue", TokenType::True),
                         _ => TokenType::Identifier
                     };
                 }
