@@ -6,9 +6,8 @@ need to be stored somewhere in the chunks. Where?
 - Save bigger data (strings) in specific memory region of the binary executable called 'constants data'.
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::rc::Rc;
+use crate::heap::{Heap, Obj, ObjRef};
 /*
 The Lox values in memory are stored in two ways:
  - On the Stack, if the data type is small and immutable.
@@ -18,17 +17,52 @@ The Lox values in memory are stored in two ways:
 pub enum Value {
     Number(f64),
     Boolean(bool),
-    String(Rc<String>),
+    Obj(ObjRef),
     Nil
 }
 
 impl Value {
-    pub fn print_value(&self) {
+    pub fn print_value(&self, heap: &Heap) {
         match self { 
             Value::Number(number) => print!("{}", number),
             Value::Boolean(bool) => print!("{}", bool),
-            Value::String(string) => print!("{}", string),
+            Value::Obj(obj_ref) => {
+                match heap.get(*obj_ref) {
+                    Obj::String(string) => print!("{}", string.chars),
+                    Obj::Function(func) => {
+                        match func.name {
+                            Some(obj_ref) => {
+                                if let Obj::String(string) = heap.get(obj_ref) {
+                                    print!("<fn {}>", string.chars)
+                                }
+                            },
+                            None => print!("<script>")
+                        }
+                    }
+                }
+            },
             Value::Nil => print!("nil")
+        }
+    }
+
+    pub fn is_string(&self, obj_ref: &ObjRef, heap: &Heap) -> bool {
+        match heap.get(*obj_ref) {
+            Obj::String(_) => true,
+            _ => false
+        }
+    }
+
+    pub fn as_string<'a>(&self, heap: &'a Heap) -> Option<&'a str> {
+        match self {
+            Value::Obj(obj_ref) => {
+                match heap.get(*obj_ref) {
+                    Obj::String(string) => {
+                        Some(&string.chars)
+                    },
+                    _ => None
+                }
+            },
+            _ => None
         }
     }
 }

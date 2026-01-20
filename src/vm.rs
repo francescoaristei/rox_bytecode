@@ -1,9 +1,71 @@
 use std::collections::HashMap;
-use std::rc::Rc;
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::{Parser};
+use crate::heap::{Heap, ObjRef};
 use crate::value::Value;
 use crate::util::disassemble_instruction;
+use crate::value::Value::Obj;
+
+
+/*
+* How should the local variables of each function be allocated on the stack?
+* Each function statically assigned a set of stack at compile time?
+* Each function call at runtime a new piece of stack memory allocated?
+* The values in the stack continue to behave in a LIFO fashion also
+* when considering in the stack the local variables of each function
+* in the code.
+* Given the following example:
+*
+* fun first() {
+*   var a = 1;
+*   second();
+*   var b = 2;
+* }
+*
+* fun second() {
+*   var c = 3;
+*   var d = 4;
+}
+first();
+*
+* The stack allocation of the variables is:
+* a,
+* a, c, d (c and d get destroyed)
+* a, b
+* -> LIFO!
+* It would be efficient to know at compile time where the variables for each function
+* should go on the stack, however knowing the absolute location is not easy:
+* fun first() {
+*   var a = 1;
+*   second();
+*   var b = 2;
+*   second();
+* }
+*
+* fun second() {
+*   var c = 3;
+*   var d = 4;
+* }
+*
+* first();
+*
+*
+* Now in ghe first call to second() c and d go into 1 and 2 slots, while in the second
+* call they go into 2 and 3 slots in the stack.
+* What however is always possible to know is the position of a local variable relative to the
+* beginning of the function it belongs to.
+* At the beginning of each function call, the VM records the location of the first slot where
+* the function locals begin.
+* The instruction working with the locals access them using the index relative to that location,
+* not the absolute one.
+* At compile time the compiler computes these relative indexes which are translated into absolute
+* indexes on the stack at runtime.
+* The name of the start of a function locals is called: frame pointer or base pointer.
+ */
+pub struct CallFrame {
+    function:
+}
+
 
 /*
 When having an instruction like: print 3 - 2; in Lox is required to have instructions
@@ -37,7 +99,8 @@ pub struct Vm {
     chunk: Chunk,
     ip: usize,
     stack: Vec<Value>,
-    globals: HashMap<Rc<String>, Value>
+    globals: HashMap<ObjRef, Value>,
+    heap: Heap
 }
 
 pub enum Error {
@@ -60,14 +123,14 @@ impl Vm {
             chunk,
             ip: 0,
             stack: Vec::new(),
-            globals: HashMap::new()
+            globals: HashMap::new(),
+            heap: Heap::new()
         }
     }
 
     pub fn interpret(&mut self, source: String) -> Result<(), Error> {
-        let mut parser = Parser::new(&source, &mut self.chunk);
-        // compiler takes the empty chunk
-        if !parser.compile() {
+        let mut parser = Parser::new(&source, &mut self.heap);
+        if parser.compile().is_none() {
             return Err(Error::InterpretCompilerError);
         }
         self.run()
@@ -80,7 +143,9 @@ impl Vm {
                 // use: cargo run --features debug-trace-execution
                 print!("        ");
                 for value in &self.stack {
-                    print!("[{}]", value);
+                    print("[");
+                    value.print_value(&self.heap);
+                    print!("]");
                 }
                 print!("\n");
                 disassemble_instruction(&self.chunk, &self.ip);
@@ -90,10 +155,6 @@ impl Vm {
             let instruction: u8 = self.read_byte();
             match OpCode::from_u8(instruction) {
                 Some(OpCode::OpReturn) => {
-                    /*if let Some(top_stack) = self.stack.pop() {
-                        top_stack.print_value();
-                    }
-                    print!("\n");*/
                     return Ok(())
                 },
                 Some(OpCode::OpNegate) => {
@@ -107,18 +168,22 @@ impl Vm {
                     }
                 },
                 Some(OpCode::OpAdd) => {
-                    match (self.peek(0), self.peek(1)) {
-                        // THIS NEEDS REFACTORING IN THE FUTURE, BECAUSE THERE IS NO STRING INTERNING
-                        // CONSIDER MOVING THE INTERNING FROM COMPILER.RS TO CHUNK.RS BECAUSE IN THIS WAY
-                        // THE HASHMAP WOULD BE ACCESSIBLE HERE IN THE VM.RS
-                        (Value::String(a_val), Value::String(b_val)) => {
-                            let ab = Value::String(Rc::new(format!("{}{}", b_val, a_val)));
+                    let a = self.peek(0);
+                    let b = self.peek(1);
+                    match (a.as_string(&self.heap), b.as_string(&self.heap)) {
+                        (Some(a_str), Some(b_str)) => {
+                            let ab = format!("{}{}", b_str, a_str);
+                            let handle = self.heap.intern_string(ab);
                             self.stack.pop();
                             self.stack.pop();
-                            self.stack.push(ab)
+                            self.stack.push(Value::Obj(handle))
                         },
-                        (Value::Number(_a_val), Value::Number(_b_val)) => self.binary_op(ArithmeticOps::Add)?,
-                        _ => return Err(self.runtime_error("Operands must be two strings or two numbers."))
+                        _ => {
+                            match (a, b) {
+                                (Value::Number(_a_val), Value::Number(_b_val)) => self.binary_op(ArithmeticOps::Add)?,
+                                _ => return Err(self.runtime_error("Operands must be two strings or two numbers."))
+                            }
+                        }
                     }
                 },
                 Some(OpCode::OpSubtract) => self.binary_op(ArithmeticOps::Subtract)?,
@@ -152,20 +217,21 @@ impl Vm {
                     which have a Stack Effect of one, regardless of how complex that expression is.
                      */
                     if let Some(stack_value) = self.stack.pop() {
-                        stack_value.print_value();
+                        stack_value.print_value(&self.heap);
                         print!("\n");
                     } else {
                         return Err(self.runtime_error("No value on the stack."))
                     }
                 },
                 Some(OpCode::OpGetGlobal) => {
-                    let name = self.read_constant().clone();
+                    let name = self.read_constant();
                     match name {
-                        Value::String(value) => {
-                            if let Some(global_var) = self.globals.get(&value) {
-                                self.stack.push(global_var.clone());
+                        Obj(obj_ref) => {
+                            if let Some(global_var) = self.globals.get(obj_ref) {
+                                self.stack.push(*global_var);
                             } else {
-                                return Err(self.runtime_error(format!("undefined variable {}", value).as_str()))
+                                let name = name.as_string(&self.heap).expect("Expected global string.");
+                                return Err(self.runtime_error(&format!("undefined variable {}", name)))
                             }
                         },
                         _ => return Err(self.runtime_error("Variable name must be a string"))
@@ -181,26 +247,26 @@ impl Vm {
                     self.stack.push(self.stack[slot as usize].clone())
                 },
                 Some(OpCode::OpDefineGlobal) => {
-                    let constant = self.read_constant().clone();
+                    let constant = self.read_constant();
                     match constant {
-                        Value::String(value) => {
-                            self.globals.insert(value, self.peek(0).clone());
+                        Obj(obj_ref) => {
+                            self.globals.insert(*obj_ref, *self.peek(0));
                             self.stack.pop();
                         },
                         _ => return Err(self.runtime_error("Variable name must be a string"))
                     }
                 },
                 Some(OpCode::OpSetGlobal) => {
-                    let constant = self.read_constant().clone();
+                    let constant = self.read_constant();
                     match constant {
-                        Value::String(value) => {
-                            if self.globals.get(&value).is_none() {
+                        Obj(obj_ref) => {
+                            if self.globals.get(&obj_ref).is_none() {
                                 // in cases like:
                                 // variable1 = "something"
                                 // where variable1 has never been defined before e.g never done: var variable1;
-                                return Err(self.runtime_error(format!("Undefined variable: {}", value).as_str()))
+                                return Err(self.runtime_error(&format!("Undefined variable: {}", name)))
                             } else {
-                                self.globals.insert(value, self.peek(0).clone());
+                                self.globals.insert(*obj_ref, *self.peek(0));
                             }
                         },
                         _ => return Err(self.runtime_error("Variable name must be a string"))
@@ -289,7 +355,7 @@ impl Vm {
         match (a, b) {
             (Value::Number(a_val), Value::Number(b_val)) => a_val == b_val,
             (Value::Boolean(a_val), Value::Boolean(b_val)) => a_val == b_val,
-            (Value::String(a_val), Value::String(b_val)) => Rc::ptr_eq(&a_val, &b_val),
+            (Obj(a_ref), Obj(b_ref)) => a_ref == b_ref,
             (Value::Nil, Value::Nil) => true,
             (_, _) => false
         }

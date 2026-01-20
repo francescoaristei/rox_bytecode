@@ -1,10 +1,11 @@
-use std::collections::HashMap;
-use std::rc::Rc;
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::Precedence::PrecedenceAssignment;
+use crate::heap::{Heap, ObjRef};
+use crate::object::{FunctionType, ObjFunction};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
-use crate::util::disassemble_chunk;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 // values put in increasing order of precedence
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
@@ -105,6 +106,12 @@ impl<'a> Local<'a> {
 }
 
 struct Compiler<'a> {
+    /*
+    * In order to allow having each function with its own chunk, the top-level program itself
+    * is a function. The VM can run by always calling a function.
+     */
+    function: Option<ObjFunction>,
+    type_fn: FunctionType,
     locals: Vec<Local<'a>>,
     local_count: u8,
     scope_depth: usize // number of blocks surrounding the current code we are compiling.
@@ -112,8 +119,25 @@ struct Compiler<'a> {
 
 impl<'a> Compiler<'a> {
     fn new() -> Self {
+        let mut locals = Vec::new();
+        // the first slot of locals is assigned to the VM
+        locals.push(
+            Local {
+                name: Token::new(""),
+                depth: Some(0)
+            }
+        );
+
         Compiler {
-            locals: Vec::new(),
+            /*
+            * A function object (runtime representation of a function)
+            * is created in the compiler (hence during compilation)
+            * because function represent something in between teh two steps,
+            * like a string.
+             */
+            function: Some(ObjFunction::new()),
+            type_fn: FunctionType::TypeScript,
+            locals,
             local_count: 0,
             scope_depth: 0
         }
@@ -130,16 +154,15 @@ pub struct Parser<'a> {
     scanner: Scanner<'a>,
     current: Token<'a>,
     previous: Token<'a>,
-    compiling_chunk: &'a mut Chunk,
     rules: HashMap<TokenType, ParseRule<'a>>,
-    strings: HashMap<String, Rc<String>>,
     compiler: Box<Compiler<'a>>,
+    heap: &'a mut Heap,
     had_error: bool,
     panic_mode: bool
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(source: &'a str, chunk: &'a mut Chunk) -> Self {
+    pub fn new(source: &'a str, heap: &'a mut Heap) -> Self {
         let mut rules_map = HashMap::new();
         rules_map.insert(TokenType::LeftParen, ParseRule::new(Some(Parser::grouping), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::RightParen, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -186,24 +209,25 @@ impl<'a> Parser<'a> {
             scanner: Scanner::new(source),
             current: Token::new("current"),
             previous: Token::new("previous"),
-            compiling_chunk: chunk,
             rules: rules_map,
-            strings: HashMap::new(),
             compiler: Box::new(Compiler::new()),
+            heap,
             had_error: false,
             panic_mode: false
         }
     }
     
-    pub fn compile(&mut self) -> bool {
+    pub fn compile(&mut self) -> Option<Rc<ObjFunction>> {
         self.advance();
         while !self.match_token_type(TokenType::Eof) {
             self.declaration();
         }
-        //self.expression();
         self.consume(TokenType::Eof, "Expect end of expression.");
-        self.end_compiler();
-        !self.had_error
+        if !self.had_error {
+            None
+        } else {
+            Some(self.end_compiler())
+        }
     }
 
     fn declaration(&mut self) {
@@ -463,7 +487,7 @@ impl<'a> Parser<'a> {
         // String interning
         let lexeme = self.previous.get_lexeme();
         let interned_identifier = self.intern_string(lexeme);
-        self.make_constant(Value::String(interned_identifier))
+        self.make_constant(Value::Obj(interned_identifier))
     }
 
     /*
@@ -627,17 +651,11 @@ impl<'a> Parser<'a> {
     fn string(&mut self, can_assign: bool) {
         let lexeme = self.previous.get_lexeme();
         let interned_string = self.intern_string(&lexeme[1..lexeme.len() - 1]);
-        self.emit_constant(Value::String(interned_string));
+        self.emit_constant(Value::Obj(interned_string));
     }
 
-    fn intern_string(&mut self, lexeme: &str) -> Rc<String> {
-        if let Some(value) = self.strings.get(lexeme) {
-            value.clone()
-        } else {
-            let value = Rc::new(lexeme.to_string());
-            self.strings.insert(lexeme.to_string(), value.clone());
-            value
-        }
+    fn intern_string(&mut self, lexeme: &str) -> ObjRef {
+        self.heap.intern_string(lexeme.to_string())
     }
 
     fn variable(&mut self, can_assign: bool) {
@@ -1100,14 +1118,23 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn end_compiler(&mut self) {
+    fn end_compiler(&mut self) -> Rc<ObjFunction> {
         #[cfg(feature = "debug-trace-execution")]
         {
+            let function_name = if let Some(name) = self.compiler.function.name {
+                match self.heap.get(name) {
+                    Obj::String(value) => &value.chars,
+                    _ => "script"
+                }
+            } else {
+                "script"
+            };
             if !self.had_error {
-                disassemble_chunk(self.current_chunk(), "code");
+                disassemble_chunk(self.current_chunk(), function_name);
             }
         }
         self.emit_return();
+        Rc::new(self.compiler.function.take().expect("Valid function."))
     }
 
     fn emit_return(&mut self) {
@@ -1126,7 +1153,8 @@ impl<'a> Parser<'a> {
     }
 
     fn current_chunk(&mut self) -> &mut Chunk {
-        self.compiling_chunk
+        // current chunk is always the chunk of the function that is being compiled
+        &mut self.compiler.function.as_mut().expect("Valid function.").chunk
     }
 
     fn advance(&mut self) {
