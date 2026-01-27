@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::{Parser};
@@ -5,9 +6,11 @@ use crate::heap::{Heap, ObjRef};
 use crate::value::Value;
 use crate::util::disassemble_instruction;
 use crate::value::Value::Obj;
+use crate::heap::HeapObj;
 
 
 /*
+* Frame/Base Pointer:
 * How should the local variables of each function be allocated on the stack?
 * Each function statically assigned a set of stack at compile time?
 * Each function call at runtime a new piece of stack memory allocated?
@@ -61,9 +64,24 @@ first();
 * At compile time the compiler computes these relative indexes which are translated into absolute
 * indexes on the stack at runtime.
 * The name of the start of a function locals is called: frame pointer or base pointer.
+*
+* Return Address:
+* The VM goes through the bytecode, incrementing the instruction pointer everytime an instruction
+* is completed. When a function completes, the VM needs to jump back to the instruction following the
+* invocation of that function. The address to which it has to jump back is what it is called the
+* return address.
+* This property is not of the function itself, but of the invocation of the function, as with recursive
+* calls there could be more return addresses for the same function.
+* A CallFrame describes a function invocation.
+* The ip is the address of the calling instruction which, when calling the function stores its location
+* in the function (CallFrame) fields.
+*
+*
  */
 pub struct CallFrame {
-    function:
+    function: ObjRef,
+    ip: Cell<usize>,
+    slots: usize
 }
 
 
@@ -96,8 +114,9 @@ to be removed, or better the last operand to be evaluated is the first to be rem
 When an instruction produces a value it pushes it in the stack and when it evaluates it, it removes it from the stack.
  */
 pub struct Vm {
-    chunk: Chunk,
-    ip: usize,
+    // The function calls (call frame) also have a natural stack behavior -> calling funcA, funcB
+    // we have that funcB is removed from the stack before funcA (which was called earlier).
+    frames: Vec<CallFrame>,
     stack: Vec<Value>,
     globals: HashMap<ObjRef, Value>,
     heap: Heap
@@ -118,10 +137,9 @@ enum ArithmeticOps {
 }
 
 impl Vm {
-    pub fn new(chunk: Chunk) -> Self {
+    pub fn new() -> Self {
         Vm {
-            chunk,
-            ip: 0,
+            frames: Vec::new(),
             stack: Vec::new(),
             globals: HashMap::new(),
             heap: Heap::new()
@@ -130,9 +148,19 @@ impl Vm {
 
     pub fn interpret(&mut self, source: String) -> Result<(), Error> {
         let mut parser = Parser::new(&source, &mut self.heap);
-        if parser.compile().is_none() {
+        let function = parser.compile();
+        if function.is_none() {
             return Err(Error::InterpretCompilerError);
         }
+        let obj_ref = self.heap.alloc(HeapObj::Function(function.unwrap()));
+        self.stack.push(Obj(obj_ref));
+        self.frames.push(
+            CallFrame {
+                function: obj_ref,
+                ip: Cell::new(0),
+                slots: 0
+            }
+        );
         self.run()
     }
 
@@ -148,7 +176,9 @@ impl Vm {
                     print!("]");
                 }
                 print!("\n");
-                disassemble_instruction(&self.chunk, &self.ip);
+                let chunk = self.get_current_chunk();
+                let ip = self.current_frame().ip.get();
+                disassemble_instruction(chunk, &ip, &self.heap);
             }
 
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
@@ -243,8 +273,12 @@ impl Vm {
                     where the local variable value is.
                     This index, is the same of the local variable name in the self.compiler.locals for the parser.
                      */
+                    let last = self.frames.len() - 1;
+                    let frame = &self.frames[last];
                     let slot = self.read_byte();
-                    self.stack.push(self.stack[slot as usize].clone())
+                    // the local variable in the call frame is at the position given by the beginning of the
+                    // call frame in the stack (frame.slots) + the relative position inside the call frame (slot)
+                    self.stack.push(self.stack[frame.slots + slot as usize].clone())
                 },
                 Some(OpCode::OpDefineGlobal) => {
                     let constant = self.read_constant();
@@ -264,6 +298,7 @@ impl Vm {
                                 // in cases like:
                                 // variable1 = "something"
                                 // where variable1 has never been defined before e.g never done: var variable1;
+                                let name = constant.as_string(&self.heap).expect("Expected global string.");
                                 return Err(self.runtime_error(&format!("Undefined variable: {}", name)))
                             } else {
                                 self.globals.insert(*obj_ref, *self.peek(0));
@@ -276,26 +311,31 @@ impl Vm {
                     /*
                     In the same way, the cell of the stack at position slot needs to be equal to the top of the stack
                      */
+                    let last = self.frames.len() - 1;
+                    let frame = &self.frames[last];
                     let slot = self.read_byte();
-                    self.stack[slot as usize] = self.peek(0).clone();
+                    self.stack[frame.slots + slot as usize] = self.peek(0).clone();
                 },
                 Some(OpCode::OpJumpIfFalse) => {
                     let offset = self.read_short();
                     // if the if condition is false, the ip is updated to proceed to the next instruction
                     // after the then_branch
                     if self.is_falsey(self.peek(0).clone()) {
-                        self.ip += offset as usize;
+                        let frame = self.current_frame();
+                        frame.ip.set(frame.ip.get() + offset as usize);
                     }
                 },
                 Some(OpCode::OpJump) => {
                     let offset = self.read_short();
+                    let frame = self.current_frame();
                     // it is an unconditional jump
-                    self.ip += offset as usize;
+                    frame.ip.set(frame.ip.get() + offset as usize);
                 },
                 Some(OpCode::OpLoop) => {
                     let offset = self.read_short();
+                    let frame = self.current_frame();
                     // loop means going backward so we decrease
-                    self.ip -= offset as usize;
+                    frame.ip.set(frame.ip.get() - offset as usize);
                 },
                 Some(OpCode::OpPop) => { self.stack.pop(); },
                 Some(OpCode::OpGreater) => self.binary_op(ArithmeticOps::Greater)?,
@@ -329,26 +369,40 @@ impl Vm {
     }
 
     fn peek(&self, distance: usize) -> &Value {
-        &self.stack[self.stack.len() - 1 -distance]
+        &self.stack[self.stack.len() - 1 - distance]
     }
 
-    fn read_byte(&mut self) -> u8 {
-        let bytecode = self.chunk.read(&self.ip);
-        self.ip += 1;
+    fn get_current_chunk(&self) -> &Chunk {
+        let last = self.frames.len() - 1;
+        let frame = &self.frames[last];
+        match self.heap.get(frame.function) {
+            HeapObj::Function(obj_function) => &obj_function.chunk,
+            _ => panic!("Expected function")
+        }
+    }
+
+    fn current_frame(&self) -> &CallFrame {
+        &self.frames[self.frames.len() - 1]
+    }
+
+    fn read_byte(&self) -> u8 {
+        let chunk = self.get_current_chunk();
+        let frame = self.current_frame();
+        let ip = frame.ip.get();
+        let bytecode = chunk.read(&ip);
+        frame.ip.set(ip + 1);
         bytecode
     }
 
-    fn read_short(&mut self) -> u16 {
-        let first_byte = self.chunk.read(&self.ip);
-        self.ip += 1;
-        let second_byte = self.chunk.read(&self.ip);
-        self.ip += 1;
-        (first_byte | second_byte) as u16
+    fn read_short(&self) -> u16 {
+        let first = self.read_byte() as u16;
+        let second = self.read_byte() as u16;
+        (first << 8) | second
     }
 
-    fn read_constant(&mut self) -> &Value {
+    fn read_constant(&self) -> &Value {
         let index = self.read_byte() as usize;
-        self.chunk.get_constant(index)
+        self.get_current_chunk().get_constant(index)
     }
 
     fn values_equal(&self, a: Value, b: Value) -> bool {
@@ -371,7 +425,9 @@ impl Vm {
 
     fn runtime_error(&self, messages: &str) -> Error {
         eprintln!("{}", messages);
-        let line = self.chunk.get_lines()[self.ip - 1];
+        let frame = self.current_frame();
+        let chunk = self.get_current_chunk();
+        let line = chunk.get_lines()[frame.ip.get() - 1];
         eprintln!("[line: {}] in script", line);
         Error::InterpretRuntimeError
     }

@@ -1,4 +1,5 @@
 use crate::chunk::{Chunk, OpCode};
+use crate::heap::Heap;
 use crate::scanner::{Token, TokenType};
 
 // Error handling
@@ -21,17 +22,17 @@ impl Error {
 }
 
 // Debugging
-pub fn disassemble_chunk(chunk: &Chunk, name: &str) {
+pub fn disassemble_chunk(chunk: &Chunk, name: &str, heap: &Heap) {
     println!("== {} ==", name);
     let mut offset = 0;
     while offset < chunk.get_code().len() {
         // instructions have different size (number of bytes) therefore
         // the offset is computed when disassembling the instruction itself.
-        offset = disassemble_instruction(chunk, &offset);
+        offset = disassemble_instruction(chunk, &offset, heap);
     }
 }
 
-pub fn disassemble_instruction(chunk: &Chunk, offset: &usize) -> usize {
+pub fn disassemble_instruction(chunk: &Chunk, offset: &usize, heap: &Heap) -> usize {
     print!("{:04}", offset);
     // a single line of lox source code, can correspond to several bytecode instructions,
     // '|' is used to mark a bytecode instruction that belongs to the same source code line
@@ -43,7 +44,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &usize) -> usize {
     }
     let byte = chunk.get_code()[*offset];
     match OpCode::from_u8(byte) {
-        Some(OpCode::OpConstant) => constant_instruction("OP_CONSTANT", chunk, offset),
+        Some(OpCode::OpConstant) => constant_instruction("OP_CONSTANT", chunk, offset, heap),
         Some(OpCode::OpTrue) => simple_instruction("OP_TRUE", offset),
         Some(OpCode::OpFalse) => simple_instruction("OP_FALSE", offset),
         Some(OpCode::OpEqual) => simple_instruction("OP_EQUAL", offset),
@@ -60,8 +61,8 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &usize) -> usize {
         Some(OpCode::OpPrint) => simple_instruction("OP_PRINT", offset),
         Some(OpCode::OpPop) => simple_instruction("OP_POP", offset),
         Some(OpCode::OpDefineGlobal) => simple_instruction("OP_DEFINE_GLOBAL", offset),
-        Some(OpCode::OpGetGlobal) => constant_instruction("OP_GET_GLOBAL", chunk, offset),
-        Some(OpCode::OpSetGlobal) => constant_instruction("OP_SET_GLOBAL", chunk, offset),
+        Some(OpCode::OpGetGlobal) => constant_instruction("OP_GET_GLOBAL", chunk, offset, heap),
+        Some(OpCode::OpSetGlobal) => constant_instruction("OP_SET_GLOBAL", chunk, offset, heap),
         Some(OpCode::OpSetLocal) => byte_instruction("OP_SET_LOCAL", chunk, offset),
         Some(OpCode::OpGetLocal) => byte_instruction("OP_GET_LOCAL", chunk, offset),
         Some(OpCode::OpJumpIfFalse) => jump_instruction("OP_JUMP_IF_FALSE", 1, chunk, offset),
@@ -91,10 +92,10 @@ fn byte_instruction(name: &str, chunk: &Chunk, offset: &usize) -> usize {
     *offset + 2
 }
 
-fn constant_instruction(name: &str, chunk: &Chunk, offset: &usize) -> usize {
+fn constant_instruction(name: &str, chunk: &Chunk, offset: &usize, heap: &Heap) -> usize {
     let constant_index = chunk.get_code()[*offset + 1] as usize;
     print!("    {:16} {:4}  ", name, constant_index);
-    chunk.get_constants().get_value(constant_index).print_value();
+    chunk.get_constants().get_value(constant_index).print_value(heap);
     print!("\n");
     *offset + 2
 }

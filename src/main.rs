@@ -58,8 +58,8 @@ fn run_prompt() {
 }
 
 fn run(source: String) -> Result<(), Error> {
-    let chunk = Chunk::new();
-    let mut vm = Vm::new(chunk);
+    Chunk::new();
+    let mut vm = Vm::new();
     vm.interpret(source)
 }
 

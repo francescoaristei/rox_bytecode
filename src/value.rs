@@ -6,14 +6,14 @@ need to be stored somewhere in the chunks. Where?
 - Save bigger data (strings) in specific memory region of the binary executable called 'constants data'.
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
-use std::fmt::{Display, Formatter};
-use crate::heap::{Heap, Obj, ObjRef};
+use crate::heap::{Heap, HeapObj, ObjRef};
+use std::fmt::Display;
 /*
 The Lox values in memory are stored in two ways:
  - On the Stack, if the data type is small and immutable.
  - On the Heap, using a pointer to the starting location to access the data for mutable, large data (String, Objects..).
  */
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum Value {
     Number(f64),
     Boolean(bool),
@@ -28,11 +28,11 @@ impl Value {
             Value::Boolean(bool) => print!("{}", bool),
             Value::Obj(obj_ref) => {
                 match heap.get(*obj_ref) {
-                    Obj::String(string) => print!("{}", string.chars),
-                    Obj::Function(func) => {
+                    HeapObj::String(string) => print!("{}", string.chars),
+                    HeapObj::Function(func) => {
                         match func.name {
                             Some(obj_ref) => {
-                                if let Obj::String(string) = heap.get(obj_ref) {
+                                if let HeapObj::String(string) = heap.get(obj_ref) {
                                     print!("<fn {}>", string.chars)
                                 }
                             },
@@ -47,7 +47,7 @@ impl Value {
 
     pub fn is_string(&self, obj_ref: &ObjRef, heap: &Heap) -> bool {
         match heap.get(*obj_ref) {
-            Obj::String(_) => true,
+            HeapObj::String(_) => true,
             _ => false
         }
     }
@@ -56,7 +56,7 @@ impl Value {
         match self {
             Value::Obj(obj_ref) => {
                 match heap.get(*obj_ref) {
-                    Obj::String(string) => {
+                    HeapObj::String(string) => {
                         Some(&string.chars)
                     },
                     _ => None
@@ -67,7 +67,7 @@ impl Value {
     }
 }
 
-impl Display for Value {
+/*impl Display for Value {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Number(number) => write!(f, "{}", number),
@@ -76,7 +76,7 @@ impl Display for Value {
             Value::Nil => write!(f, "nil")
         }
     }
-}
+}*/
 
 pub struct Values {
     values: Vec<Value>

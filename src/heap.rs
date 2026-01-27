@@ -5,13 +5,13 @@ use crate::object::{ObjFunction, ObjString};
 pub struct ObjRef(usize);
 
 // All heap-allocated object types
-pub enum Obj {
+pub enum HeapObj {
     String(ObjString),
     Function(ObjFunction)
 }
 
 pub struct Heap {
-    objects: Vec<Option<Obj>>,
+    objects: Vec<Option<HeapObj>>,
     free_slots: Vec<usize>, // reusable indices
 
     // String interning
@@ -31,7 +31,7 @@ impl Heap {
         }
     }
     
-    pub fn alloc(&mut self, obj: Obj) -> ObjRef {
+    pub fn alloc(&mut self, obj: HeapObj) -> ObjRef {
         let index = if let Some(free) = self.free_slots.pop() {
             self.objects[free] = Some(obj);
             free
@@ -42,11 +42,11 @@ impl Heap {
         ObjRef(index)
     }
     
-    pub fn get_mut(&mut self, handle: ObjRef) -> &mut Obj {
+    pub fn get_mut(&mut self, handle: ObjRef) -> &mut HeapObj {
         self.objects[handle.0].as_mut().expect("dangling ObjRef")
     }
     
-    pub fn get(&self, handle: ObjRef) -> &Obj {
+    pub fn get(&self, handle: ObjRef) -> &HeapObj {
         self.objects[handle.0].as_ref().expect("dangling ObjRef")
     }
     
@@ -54,7 +54,7 @@ impl Heap {
         if let Some(&handle) = self.strings.get(&s) {
             return handle;
         }
-        let handle = self.alloc(Obj::String(ObjString { chars: s.clone() }));
+        let handle = self.alloc(HeapObj::String(ObjString { chars: s.clone() }));
         self.strings.insert(s, handle);
         handle
     }

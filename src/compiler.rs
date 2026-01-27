@@ -5,7 +5,6 @@ use crate::object::{FunctionType, ObjFunction};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 // values put in increasing order of precedence
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
@@ -138,7 +137,7 @@ impl<'a> Compiler<'a> {
             function: Some(ObjFunction::new()),
             type_fn: FunctionType::TypeScript,
             locals,
-            local_count: 0,
+            local_count: 1,
             scope_depth: 0
         }
     }
@@ -217,13 +216,13 @@ impl<'a> Parser<'a> {
         }
     }
     
-    pub fn compile(&mut self) -> Option<Rc<ObjFunction>> {
+    pub fn compile(&mut self) -> Option<ObjFunction> {
         self.advance();
         while !self.match_token_type(TokenType::Eof) {
             self.declaration();
         }
         self.consume(TokenType::Eof, "Expect end of expression.");
-        if !self.had_error {
+        if self.had_error {
             None
         } else {
             Some(self.end_compiler())
@@ -1118,7 +1117,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn end_compiler(&mut self) -> Rc<ObjFunction> {
+    fn end_compiler(&mut self) -> ObjFunction {
         #[cfg(feature = "debug-trace-execution")]
         {
             let function_name = if let Some(name) = self.compiler.function.name {
@@ -1130,11 +1129,11 @@ impl<'a> Parser<'a> {
                 "script"
             };
             if !self.had_error {
-                disassemble_chunk(self.current_chunk(), function_name);
+                disassemble_chunk(self.current_chunk(), function_name, &self.heap);
             }
         }
         self.emit_return();
-        Rc::new(self.compiler.function.take().expect("Valid function."))
+        self.compiler.function.take().expect("Valid function.")
     }
 
     fn emit_return(&mut self) {
