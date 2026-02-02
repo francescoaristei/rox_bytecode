@@ -1,10 +1,12 @@
 use crate::chunk::Chunk;
 use crate::heap::ObjRef;
+use crate::value::Value;
 
 pub struct ObjString {
     pub chars: String
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub enum FunctionType {
     TypeFunction,
     TypeScript
@@ -29,6 +31,31 @@ impl ObjFunction {
             chunk: Chunk::new(),
             name: None,
             upvalue_count: 0
+        }
+    }
+}
+
+// function pointer for native functions
+pub type NativeFn = fn(arg_count: u8, args: &[Value]) -> Value;
+
+/*
+* In order to do stuff a programming language implementation needs
+* native functions (to read file system, read user input etc).
+* These are called from Lox but implemented in the language used
+* to implement Lox.
+* Native functions don't call a CallFrame because there is no bytecode
+* that frame could point to, they reference native (Rust in this case) code.
+ */
+pub struct ObjNativeFunction {
+    pub name: Option<ObjRef>,
+    pub fun: NativeFn
+}
+
+impl ObjNativeFunction {
+    pub fn new(native_fn: NativeFn) -> Self {
+        ObjNativeFunction {
+            name: None,
+            fun: native_fn
         }
     }
 }

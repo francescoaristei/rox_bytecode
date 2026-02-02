@@ -1,3 +1,4 @@
+use crate::chunk::OpCode::OpCall;
 use crate::value::{Value, Values};
 
 /*
@@ -34,7 +35,8 @@ pub enum OpCode {
     OpJumpIfFalse = 20,
     OpJump = 21,
     OpLoop = 22,
-    OpReturn = 23
+    OpReturn = 23,
+    OpCall = 24
 }
 
 impl OpCode {
@@ -64,6 +66,7 @@ impl OpCode {
             21 => Some(OpCode::OpJump),
             22 => Some(OpCode::OpLoop),
             23 => Some(OpCode::OpReturn),
+            24 => Some(OpCode::OpCall),
             _ => None
         }
     }

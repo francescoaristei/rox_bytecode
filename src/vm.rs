@@ -1,14 +1,12 @@
-use std::cell::Cell;
-use std::collections::HashMap;
 use crate::chunk::{Chunk, OpCode};
-use crate::compiler::{Parser};
+use crate::compiler::Parser;
+use crate::heap::HeapObj;
 use crate::heap::{Heap, ObjRef};
 use crate::value::Value;
-use crate::util::disassemble_instruction;
 use crate::value::Value::Obj;
-use crate::heap::HeapObj;
-
-
+use std::cell::Cell;
+use std::collections::HashMap;
+use crate::object::{NativeFn, ObjNativeFunction};
 /*
 * Frame/Base Pointer:
 * How should the local variables of each function be allocated on the stack?
@@ -146,7 +144,14 @@ impl Vm {
         }
     }
 
+    // example of native function
+    fn clock_native(arg_count: u8, args: &[Value]) -> Value {
+        let start = std::time::Instant::now();
+        Value::Number(start.elapsed().as_secs_f64())
+    }
+
     pub fn interpret(&mut self, source: String) -> Result<(), Error> {
+        self.define_native("clock", Self::clock_native);
         let mut parser = Parser::new(&source, &mut self.heap);
         let function = parser.compile();
         if function.is_none() {
@@ -154,13 +159,14 @@ impl Vm {
         }
         let obj_ref = self.heap.alloc(HeapObj::Function(function.unwrap()));
         self.stack.push(Obj(obj_ref));
-        self.frames.push(
+        /*self.frames.push(
             CallFrame {
                 function: obj_ref,
                 ip: Cell::new(0),
                 slots: 0
             }
-        );
+        );*/
+        self.call(obj_ref, 0);
         self.run()
     }
 
@@ -184,8 +190,52 @@ impl Vm {
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
             let instruction: u8 = self.read_byte();
             match OpCode::from_u8(instruction) {
+                /*
+                * When a function returns, the return value is on the top of the stack.
+                * - The return value is popped from the stack. A
+                * - The call frame of the returning function is discarded. B
+                * - If it was the most-outer function (the script) then we return. C
+                * - Otherwise, all the slots used by the returning function for local variables etc are discarded. D
+                * - The returned value is pushed again onto the stack. E
+                * - The frame is now the one of the caller, at the next iteration the instruction pointer will point to it.
+                *
+                * |------------------------------------| --> top level code
+                *
+                * script    4   sum     5   6   7   18
+                *
+                *              |-----------------| --> function sum()
+                *
+                * B,C,D
+                * |------------------------------------| --> top level code
+                *
+                * script    4   sum     5   6   7                           popped --> 18
+                *
+                *              |-----------------| --> function sum()
+                *
+                *
+                * B,C,D
+                * |------------------------------------| --> top level code
+                *
+                * script    4                                               popped --> 18
+                *
+                *
+                * E
+                * |------------------------------------| --> top level code
+                *
+                * script    4   18 <-- pushed
+                *
+                *
+                *
+                 */
                 Some(OpCode::OpReturn) => {
-                    return Ok(())
+                    let result = self.stack.pop();
+                    let frame = self.frames.pop().expect("Expect frame of the returning function.");
+                    if self.frames.is_empty() {
+                        self.stack.pop();
+                        return Ok(())
+                    }
+                    self.stack.truncate(frame.slots);
+                    self.stack.push(result.expect("Expected value returned from the function."));
                 },
                 Some(OpCode::OpNegate) => {
                     match self.peek(0) {
@@ -206,7 +256,7 @@ impl Vm {
                             let handle = self.heap.intern_string(ab);
                             self.stack.pop();
                             self.stack.pop();
-                            self.stack.push(Value::Obj(handle))
+                            self.stack.push(Obj(handle))
                         },
                         _ => {
                             match (a, b) {
@@ -337,6 +387,38 @@ impl Vm {
                     // loop means going backward so we decrease
                     frame.ip.set(frame.ip.get() - offset as usize);
                 },
+                /*
+                * Given the following code:
+                * fun sum(a, b, c) {
+                *  return a + b + c;
+                * }
+                *
+                * print 4 + sum(5, 6, 7);
+                *
+                * At the time of the OP_CALL the stack looks like this:
+                *
+                * [script, 4, sum, 5, 6, 7]
+                *
+                * When the function its compiled, it's local 0 slot is
+                * allocated for the function name, then the slots for the
+                * parameters are allocated.
+                * Each function also needs to have a CallFrame associated with it.
+                * It is important to collect the arguments with which the function is
+                * called, and put them in the already allocated slots of the function (for the parameters).
+                * For how the stack is populated, this is achieved "for free", meaning that this is the stack:
+                * 0     1       2       3       4       5 <- indexes of the top level caller
+                * [..   ..     [sum     5       6       7]] the parentheses define the global vs local stack
+                *               0       1       2       3 <- indexes of sum(), the callee
+                *
+                * Is free to bind an argument to a parameter.
+                 */
+                Some(OpCode::OpCall) => {
+                    let arg_count = self.read_byte();
+                    let value = self.peek(arg_count as usize);
+                    if !self.call_value(*value, arg_count) {
+                        return Err(self.runtime_error("Runtime error while calling function."))
+                    }
+                },
                 Some(OpCode::OpPop) => { self.stack.pop(); },
                 Some(OpCode::OpGreater) => self.binary_op(ArithmeticOps::Greater)?,
                 Some(OpCode::OpLess) => self.binary_op(ArithmeticOps::Less)?,
@@ -347,8 +429,62 @@ impl Vm {
         }
     }
 
+    /*
+    * When this is called, on the stack (local stack) there is on the first slot
+    * the name of the function, beneath all the arguments needed by it.
+    * Using the arg_count is therefore possible to access the name of the function
+     */
+    fn call_value(&mut self, value: Value, arg_count: u8) -> bool {
+        match value {
+            Obj(obj_ref) => {
+                match self.heap.get(obj_ref) {
+                    HeapObj::Function(_) => self.call(obj_ref, arg_count),
+                    HeapObj::NativeFunction(native_fn) => {
+                        let result = (native_fn.fun)(arg_count, &self.stack[arg_count as usize..self.stack.len()]);
+                        self.stack.truncate(arg_count as usize + 1);
+                        self.stack.push(result);
+                        true
+                    },
+                    _ => false
+                }
+            },
+            _ => {
+                self.runtime_error("Can only call functions and classes.");
+                false
+            }
+        }
+    }
+
+    /*
+    * It initializes the frame of the called function
+    * pushing it into the stack of frames.
+     */
+    fn call(&mut self, obj_ref: ObjRef, arg_count: u8) -> bool {
+        let arity = match self.heap.get(obj_ref) {
+            HeapObj::Function(obj_function) => obj_function.arity,
+            _ => panic!("Not a function")
+        };
+
+        if arity != arg_count as usize {
+            self.runtime_error(&format!("Expected {} arguments but got {}", arity, arg_count));
+            return false;
+        }
+
+        // NOTE: I AVOIDED CHECKING ON THE MAXIMUM STACK FRAMES SIZE
+
+        let frame = CallFrame {
+            function: obj_ref,
+            ip: Cell::new(0),
+            // the start of the slots for that frame
+            // the -1 is because the slot 0 is reserved for methods by the compiler.
+            slots: self.stack.len() - (arg_count as usize) - 1
+        };
+        self.frames.push(frame);
+        true
+    }
+
     fn binary_op(&mut self, operation: ArithmeticOps) -> Result<(), Error> {
-        return match (self.peek(0), self.peek(1)) {
+        match (self.peek(0), self.peek(1)) {
             (Value::Number(b_ref), Value::Number(a_ref)) => {
                 let b = *b_ref;
                 let a = *a_ref;
@@ -423,8 +559,39 @@ impl Vm {
         }
     }
 
+    fn define_native(&mut self, name: &str, fun: NativeFn) {
+        // intern the name of the native function and get the obj ref
+        let name_handle = self.heap.intern_string(name.to_string());
+        // allocate the native function on the heap and get the obj ref
+        let obj_native = ObjNativeFunction::new(fun);
+        let fun_handle = self.heap.alloc(HeapObj::NativeFunction(obj_native));
+        // insert in the globals as key the obj ref of the interned string and as key the Obj having
+        // value the obj ref of the native function on the heap
+        self.globals.insert(name_handle, Obj(fun_handle));
+    }
+
     fn runtime_error(&self, messages: &str) -> Error {
         eprintln!("{}", messages);
+        // the call stack is shown from the most recently called
+        // function to the first called function
+        for frame in self.frames.iter().rev() {
+            match self.heap.get(frame.function) {
+                HeapObj::Function(obj_function) => {
+                    let line = obj_function.chunk.get_lines()[frame.ip.get() - 1];
+                    eprint!("[line {}] in ", line);
+                    match obj_function.name {
+                        Some(name_ref) => {
+                            match self.heap.get(name_ref) {
+                                HeapObj::String(name) => eprintln!("{}()", name.chars),
+                                _ => ()
+                            }
+                        },
+                        None => eprintln!("script")
+                    }
+                },
+                _ => panic!("Must be a function.")
+            }
+        }
         let frame = self.current_frame();
         let chunk = self.get_current_chunk();
         let line = chunk.get_lines()[frame.ip.get() - 1];

@@ -1,10 +1,13 @@
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::Precedence::PrecedenceAssignment;
-use crate::heap::{Heap, ObjRef};
+use crate::heap::{Heap, HeapObj, ObjRef};
+use crate::object::FunctionType::TypeFunction;
 use crate::object::{FunctionType, ObjFunction};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
+use crate::value::Value::Obj;
 use std::collections::HashMap;
+use std::mem::replace;
 
 // values put in increasing order of precedence
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
@@ -113,7 +116,8 @@ struct Compiler<'a> {
     type_fn: FunctionType,
     locals: Vec<Local<'a>>,
     local_count: u8,
-    scope_depth: usize // number of blocks surrounding the current code we are compiling.
+    scope_depth: usize, // number of blocks surrounding the current code we are compiling.
+    enclosing: Option<Box<Compiler<'a>>>
 }
 
 impl<'a> Compiler<'a> {
@@ -138,7 +142,8 @@ impl<'a> Compiler<'a> {
             type_fn: FunctionType::TypeScript,
             locals,
             local_count: 1,
-            scope_depth: 0
+            scope_depth: 0,
+            enclosing: None
         }
     }
 }
@@ -163,7 +168,7 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str, heap: &'a mut Heap) -> Self {
         let mut rules_map = HashMap::new();
-        rules_map.insert(TokenType::LeftParen, ParseRule::new(Some(Parser::grouping), None, Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::LeftParen, ParseRule::new(Some(Parser::grouping), Some(Parser::call), Precedence::PrecedenceNone));
         rules_map.insert(TokenType::RightParen, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::LeftBrace, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::RightBrace, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -232,12 +237,36 @@ impl<'a> Parser<'a> {
     fn declaration(&mut self) {
         if self.match_token_type(TokenType::Var) {
             self.var_declaration();
+        } else if self.match_token_type(TokenType::Fun) {
+            self.fun_declaration();
         } else {
             self.statement();
         }
         if self.panic_mode {
             self.synchronize();
         }
+    }
+
+    /*
+    * A function declaration is nothing else than a variable declaration
+    * Depending on if the function is declared at top-scope or in a local scope
+    * it will originate into a global or local variable.
+    * Differently from variables which gets defined in two steps, to avoid accessing
+    * a variable not yet initialized, with function this is legit, to allow for recursion.
+     */
+    fn fun_declaration(&mut self) {
+        let global = self.parse_variable("Expect function name");
+        // the function is defined as initialized as soon as the name is compiled
+        // so that it can already be referenced without causing errors
+        self.mark_initialized();
+
+        // helper function to compile the body of the function
+        self.function(TypeFunction);
+
+        // now the body of the function is on top of the stack
+        // therefore the previously defined variable is bounded to
+        // its body
+        self.define_variable(global);
     }
 
     fn var_declaration(&mut self) {
@@ -259,6 +288,8 @@ impl<'a> Parser<'a> {
             self.for_statement();
         } else if self.match_token_type(TokenType::If) {
             self.if_statement();
+        } else if self.match_token_type(TokenType::Return) {
+            self.return_statement();
         } else if self.match_token_type(TokenType::While) {
             self.while_statement();
         } else if self.match_token_type(TokenType::LeftBrace) {
@@ -267,6 +298,19 @@ impl<'a> Parser<'a> {
             self.end_scope();
         } else {
             self.expression_statement();
+        }
+    }
+
+    fn return_statement(&mut self) {
+        if self.compiler.type_fn == FunctionType::TypeScript {
+            self.error("Can't return from top-level code.");
+        }
+        if self.match_token_type(TokenType::Semicolon) {
+            self.emit_return();
+        } else {
+            self.expression();
+            self.consume(TokenType::Semicolon, "Expect ';' after return.");
+            self.emit_byte(OpCode::OpReturn.to_u8());
         }
     }
 
@@ -449,6 +493,52 @@ impl<'a> Parser<'a> {
         self.consume(TokenType::RightBrace, "Expect '}' after the block.")
     }
 
+    fn function(&mut self, function_type: FunctionType) {
+        /*
+        * A compiler stores information such as which stack slots
+        * are owned by which local variables.
+        * Such information is function-specific, given the nesting of
+        * functions is required to nest compilers as well, assigning to each
+        * function a compiler, whose "enclosing" compiler is saved in the current
+        * compiler self.enclosing field.
+        * As the body of the function is compiled, the bytecode is emitted and written
+        * into the chunk owned by the function that the current compiler is assigned to.
+         */
+        let mut compiler = Compiler::new();
+        compiler.type_fn = function_type;
+        let enclosing_compiler = replace(self.compiler.as_mut(), compiler);
+        self.compiler.enclosing = Some(Box::from(enclosing_compiler));
+        if function_type != FunctionType::TypeScript {
+            let name = self.heap.intern_string(self.previous.get_lexeme().to_string());
+            self.compiler.function.take().expect("Expect current function").name = Some(name);
+        }
+        self.begin_scope();
+
+        self.consume(TokenType::LeftParen, "Expect '(' after function name.");
+        if !self.check(TokenType::RightParen) {
+            loop {
+                let mut current_function = self.compiler.function.take().expect("Expect function");
+                current_function.arity += 1;
+                if current_function.arity > 255 {
+                    self.error_at_current("Cannot have more than 255 parameters.");
+                }
+                let constant = self.parse_variable("Expect parameter name.");
+                self.define_variable(constant);
+                if !self.match_token_type(TokenType::Comma) {
+                    break
+                }
+            }
+        }
+        self.consume(TokenType::RightParen, "Expect ')' after function name.");
+        self.consume(TokenType::LeftBrace, "Expect '{' before function body.");
+
+        self.block();
+        let function = self.end_compiler();
+        let obj_ref = self.heap.alloc(HeapObj::Function(function));
+        let constant = self.make_constant(Obj(obj_ref));
+        self.emit_bytes(OpCode::OpConstant.to_u8(), constant)
+    }
+
     /*
     An expression followed by the ';', it is used to use an expression where a statement
     is expected.
@@ -517,6 +607,10 @@ impl<'a> Parser<'a> {
     }
 
     fn mark_initialized(&mut self) {
+        // if it has been called from global environment just return, it is a global variable
+        if self.compiler.scope_depth == 0 {
+            return
+        }
         /* Once the variable has declared and its initializer defined, it becomes available for use (defined).
         To avoid cases like:
         {
@@ -566,6 +660,42 @@ impl<'a> Parser<'a> {
         let local = Local::new(name, None);
         self.compiler.local_count += 1;
         self.compiler.locals.push(local);
+    }
+
+    /*
+    * Once the left paren has been compiled,
+    * the arguments of the function call are compiled
+    * via the argument_list, which puts them in the stack
+    * then it returns the number of arguments in order to
+    * understand how many values to pick up from the stack.
+    * Then it emits the OP_CALL which executes the body of the
+    * function, using the parameters.
+     */
+    fn call(&mut self, can_assign: bool) {
+        let arguments = self.argument_list();
+        self.emit_bytes(OpCode::OpCall.to_u8(), arguments)
+    }
+
+    fn argument_list(&mut self) -> u8 {
+        let mut arg_count: u8 = 0;
+        if self.check(TokenType::RightParen) {
+            loop {
+                self.expression();
+                /*
+                * Now is clear why it is required to have max 255 arguments:
+                * having the arg_count as an u8 (1 byte) is not possible to represent more.
+                 */
+                if arg_count == 255 {
+                    self.error("Cannot have more than 255 arguments.");
+                }
+                arg_count += 1;
+                if self.match_token_type(TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(TokenType::RightParen, "Expect ')' after function arguments.");
+        arg_count
     }
 
     /*
@@ -1133,10 +1263,12 @@ impl<'a> Parser<'a> {
             }
         }
         self.emit_return();
+        self.compiler = self.compiler.enclosing.take().expect("Expect enclosing compiler.");
         self.compiler.function.take().expect("Valid function.")
     }
 
     fn emit_return(&mut self) {
+        self.emit_byte(OpCode::OpNil.to_u8());
         self.emit_byte(OpCode::OpReturn.to_u8());
     }
 

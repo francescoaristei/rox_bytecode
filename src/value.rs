@@ -29,19 +29,22 @@ impl Value {
             Value::Obj(obj_ref) => {
                 match heap.get(*obj_ref) {
                     HeapObj::String(string) => print!("{}", string.chars),
-                    HeapObj::Function(func) => {
-                        match func.name {
-                            Some(obj_ref) => {
-                                if let HeapObj::String(string) = heap.get(obj_ref) {
-                                    print!("<fn {}>", string.chars)
-                                }
-                            },
-                            None => print!("<script>")
-                        }
-                    }
+                    HeapObj::Function(func) => { self.display_function(func.name, heap) },
+                    HeapObj::NativeFunction(native_func) => { self.display_function(native_func.name, heap) }
                 }
             },
             Value::Nil => print!("nil")
+        }
+    }
+
+    fn display_function(&self, obj_ref: Option<ObjRef>, heap: &Heap) {
+        match obj_ref {
+            Some(obj_ref) => {
+                if let HeapObj::String(string) = heap.get(obj_ref) {
+                    print!("<fn {}>", string.chars)
+                }
+            },
+            None => print!("<script>")
         }
     }
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::object::{ObjFunction, ObjString};
+use crate::object::{ObjFunction, ObjNativeFunction, ObjString};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ObjRef(usize);
@@ -7,9 +7,14 @@ pub struct ObjRef(usize);
 // All heap-allocated object types
 pub enum HeapObj {
     String(ObjString),
-    Function(ObjFunction)
+    Function(ObjFunction),
+    NativeFunction(ObjNativeFunction)
 }
 
+
+/*
+* Used to manage Lox runtime objects the VM operates on
+ */
 pub struct Heap {
     objects: Vec<Option<HeapObj>>,
     free_slots: Vec<usize>, // reusable indices
