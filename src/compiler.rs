@@ -168,7 +168,7 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str, heap: &'a mut Heap) -> Self {
         let mut rules_map = HashMap::new();
-        rules_map.insert(TokenType::LeftParen, ParseRule::new(Some(Parser::grouping), Some(Parser::call), Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::LeftParen, ParseRule::new(Some(Parser::grouping), Some(Parser::call), Precedence::PrecedenceCall));
         rules_map.insert(TokenType::RightParen, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::LeftBrace, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::RightBrace, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -510,14 +510,14 @@ impl<'a> Parser<'a> {
         self.compiler.enclosing = Some(Box::from(enclosing_compiler));
         if function_type != FunctionType::TypeScript {
             let name = self.heap.intern_string(self.previous.get_lexeme().to_string());
-            self.compiler.function.take().expect("Expect current function").name = Some(name);
+            self.compiler.function.as_mut().expect("Expect current function").name = Some(name);
         }
         self.begin_scope();
 
         self.consume(TokenType::LeftParen, "Expect '(' after function name.");
         if !self.check(TokenType::RightParen) {
             loop {
-                let mut current_function = self.compiler.function.take().expect("Expect function");
+                let current_function = self.compiler.function.as_mut().expect("Expect function");
                 current_function.arity += 1;
                 if current_function.arity > 255 {
                     self.error_at_current("Cannot have more than 255 parameters.");
@@ -678,7 +678,7 @@ impl<'a> Parser<'a> {
 
     fn argument_list(&mut self) -> u8 {
         let mut arg_count: u8 = 0;
-        if self.check(TokenType::RightParen) {
+        if !self.check(TokenType::RightParen) {
             loop {
                 self.expression();
                 /*
@@ -689,7 +689,7 @@ impl<'a> Parser<'a> {
                     self.error("Cannot have more than 255 arguments.");
                 }
                 arg_count += 1;
-                if self.match_token_type(TokenType::Comma) {
+                if !self.match_token_type(TokenType::Comma) {
                     break;
                 }
             }
@@ -1263,8 +1263,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.emit_return();
-        self.compiler = self.compiler.enclosing.take().expect("Expect enclosing compiler.");
-        self.compiler.function.take().expect("Valid function.")
+        let function = self.compiler.function.take().expect("Valid function.");
+        if let Some(enclosing) = self.compiler.enclosing.take() {
+            self.compiler = enclosing;
+        }
+        function
     }
 
     fn emit_return(&mut self) {

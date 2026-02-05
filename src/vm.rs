@@ -145,9 +145,11 @@ impl Vm {
     }
 
     // example of native function
-    fn clock_native(arg_count: u8, args: &[Value]) -> Value {
-        let start = std::time::Instant::now();
-        Value::Number(start.elapsed().as_secs_f64())
+    fn clock_native(_arg_count: u8, _args: &[Value]) -> Value {
+        let duration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        Value::Number(duration.as_secs_f64())
     }
 
     pub fn interpret(&mut self, source: String) -> Result<(), Error> {
