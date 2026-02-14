@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::object::{ObjFunction, ObjNativeFunction, ObjString};
+use crate::object::{ObjClosure, ObjFunction, ObjNativeFunction, ObjString, ObjUpvalue};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ObjRef(usize);
@@ -8,9 +8,73 @@ pub struct ObjRef(usize);
 pub enum HeapObj {
     String(ObjString),
     Function(ObjFunction),
-    NativeFunction(ObjNativeFunction)
+    NativeFunction(ObjNativeFunction),
+    Closure(ObjClosure),
+    Upvalue(ObjUpvalue)
 }
 
+impl HeapObj {
+    pub fn as_string(&self) -> &ObjString {
+        match self {
+            HeapObj::String(v) => v,
+            _ => panic!("Expected String")
+        }
+    }
+    pub fn as_string_mut(&mut self) -> &mut ObjString {
+        match self {
+            HeapObj::String(v) => v,
+            _ => panic!("Expected String")
+        }
+    }
+    pub fn as_function(&self) -> &ObjFunction {
+        match self {
+            HeapObj::Function(v) => v,
+            _ => panic!("Expected Function")
+        }
+    }
+    pub fn as_function_mut(&mut self) -> &mut ObjFunction {
+        match self {
+            HeapObj::Function(v) => v,
+            _ => panic!("Expected Function")
+        }
+    }
+    pub fn as_native_function(&self) -> &ObjNativeFunction {
+        match self {
+            HeapObj::NativeFunction(v) => v,
+            _ => panic!("Expected NativeFunction")
+        }
+    }
+    pub fn as_native_function_mut(&mut self) -> &mut ObjNativeFunction {
+        match self {
+            HeapObj::NativeFunction(v) => v,
+            _ => panic!("Expected NativeFunction")
+        }
+    }
+    pub fn as_closure(&self) -> &ObjClosure {
+        match self {
+            HeapObj::Closure(v) => v,
+            _ => panic!("Expected Closure")
+        }
+    }
+    pub fn as_closure_mut(&mut self) -> &mut ObjClosure {
+        match self {
+            HeapObj::Closure(v) => v,
+            _ => panic!("Expected Closure")
+        }
+    }
+    pub fn as_upvalue(&self) -> &ObjUpvalue {
+        match self {
+            HeapObj::Upvalue(v) => v,
+            _ => panic!("Expected Upvalue")
+        }
+    }
+    pub fn as_upvalue_mut(&mut self) -> &mut ObjUpvalue {
+        match self {
+            HeapObj::Upvalue(v) => v,
+            _ => panic!("Expected Upvalue")
+        }
+    }
+}
 
 /*
 * Used to manage Lox runtime objects the VM operates on

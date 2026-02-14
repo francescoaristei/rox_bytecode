@@ -6,7 +6,7 @@ use crate::value::Value;
 use crate::value::Value::Obj;
 use std::cell::Cell;
 use std::collections::HashMap;
-use crate::object::{NativeFn, ObjNativeFunction};
+use crate::object::{NativeFn, ObjClosure, ObjNativeFunction, ObjUpvalue};
 /*
 * Frame/Base Pointer:
 * How should the local variables of each function be allocated on the stack?
@@ -77,7 +77,8 @@ first();
 *
  */
 pub struct CallFrame {
-    function: ObjRef,
+    closure: ObjRef,
+    //function: ObjRef,
     ip: Cell<usize>,
     slots: usize
 }
@@ -117,7 +118,8 @@ pub struct Vm {
     frames: Vec<CallFrame>,
     stack: Vec<Value>,
     globals: HashMap<ObjRef, Value>,
-    heap: Heap
+    heap: Heap,
+    upvalues: Option<ObjRef>
 }
 
 pub enum Error {
@@ -140,7 +142,8 @@ impl Vm {
             frames: Vec::new(),
             stack: Vec::new(),
             globals: HashMap::new(),
-            heap: Heap::new()
+            heap: Heap::new(),
+            upvalues: None
         }
     }
 
@@ -159,8 +162,10 @@ impl Vm {
         if function.is_none() {
             return Err(Error::InterpretCompilerError);
         }
-        let obj_ref = self.heap.alloc(HeapObj::Function(function.unwrap()));
-        self.stack.push(Obj(obj_ref));
+        let obj_function_ref = self.heap.alloc(HeapObj::Function(function.unwrap()));
+        let closure = ObjClosure::new(obj_function_ref);
+        let obj_function_closure = self.heap.alloc(HeapObj::Closure(closure));
+        self.stack.push(Obj(obj_function_closure));
         /*self.frames.push(
             CallFrame {
                 function: obj_ref,
@@ -168,7 +173,7 @@ impl Vm {
                 slots: 0
             }
         );*/
-        self.call(obj_ref, 0);
+        self.call(obj_function_closure, 0);
         self.run()
     }
 
@@ -192,6 +197,124 @@ impl Vm {
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
             let instruction: u8 = self.read_byte();
             match OpCode::from_u8(instruction) {
+                Some(OpCode::OpCloseUpValue) => {
+                    self.close_upvalues(self.stack.len() - 1);
+                    self.stack.pop();
+                },
+                /*
+                * Peeks the top of the stack Value.
+                * - Upvalue open: stores Value in the stack at the location: frame.closure.upvalues[slot].location
+                * - Upvalue closed: stores Value in the closed field of the upvalue: frame.closure.upvalues[slot]
+                 */
+                Some(OpCode::OpSetUpValue) => {
+                    let slot = self.read_byte();
+                    let value = *self.peek(0);
+                    let last = self.frames.len() - 1;
+                    let frame = &self.frames[last];
+                    let obj_upvalue = self.heap.get(frame.closure).as_closure().obj_upvalues[slot as usize];
+                    let upvalue = self.heap.get_mut(obj_upvalue).as_upvalue_mut();
+                    if upvalue.closed.is_none() {
+                        self.stack[upvalue.location] = value;
+                    } else {
+                        upvalue.closed = Some(value);
+                    }
+                },
+                /*
+                * Reads the operand byte as an upvalue index.
+                * Looks up the corresponding upvalue in the current closure upvalues array.
+                * Upvalue:
+                * - Open: Pushes onto the stack the value at the stack position upvalue.location.
+                * - Closed: Pushes onto the stack the value stored in the closed field of the upvalue.
+                 */
+                Some(OpCode::OpGetUpValue) => {
+                    // reads the operand byte as an upvalue index
+                    let slot = self.read_byte();
+
+                    let last = self.frames.len() - 1;
+                    let frame = &self.frames[last];
+
+                    // looks up the corresponding upvalue in the current closure's upvalue array
+                    let upvalue_ref = self.heap.get(frame.closure).as_closure().obj_upvalues[slot as usize];
+                    let upvalue = self.heap.get(upvalue_ref).as_upvalue();
+
+                    if let Some(closed) = upvalue.closed {
+                        self.stack.push(closed)
+                    } else {
+                        self.stack.push(self.stack[upvalue.location]);
+                    }
+                }
+                Some(OpCode::OpClosure) => {
+                    let constant = self.read_constant().clone();
+                    match constant {
+                        Obj(obj_ref) => {
+                            let upvalue_count = self.heap.get(obj_ref).as_function().upvalue_count;
+                            let obj_closure = ObjClosure::new(obj_ref);
+                            let closure_ref = self.heap.alloc(HeapObj::Closure(obj_closure));
+                            self.stack.push(Obj(closure_ref));
+
+                            /*
+                              The compiler writes, the VM reads.
+
+                              Compiler side — when compiling a function declaration, after the function body is compiled:
+                              OP_CLOSURE
+                              <constant index>     ← points to the ObjFunction in the constants table
+                              <is_local> <index>   ← pair for upvalue 0
+                              <is_local> <index>   ← pair for upvalue 1
+                              ...                  ← one pair per upvalue
+
+                              The compiler iterates over its compile-time upvalue array and serializes each one as two bytes into the bytecode.
+                              This makes OP_CLOSURE a variable-length instruction — its size
+                              depends on how many upvalues the function captures.
+
+                              VM side — when executing OP_CLOSURE
+                              The VM reads the constant index, gets the ObjFunction, creates an ObjClosure.
+                              Then it needs to populate the closure's runtime upvalue array. It knows how many pairs to read from
+                              ObjFunction.upvalue_count.
+                              For each pair, it reads the two bytes the compiler wrote and uses them
+                              to either create a new runtime upvalue (pointing to a stack slot) or share an
+                              existing one from the enclosing closure
+                              Concrete example with:
+                              fun outer() {
+                                  var x = 1;
+                                  var y = 2;
+                                  fun inner() { print x; print y; }
+                              }
+                              The compiler emits:
+                              OP_CLOSURE  <const index of inner>
+                              1  3        ← upvalue 0: is_local=true, index=3 (x's stack slot in outer)
+                              1  4        ← upvalue 1: is_local=true, index=4 (y's stack slot in outer)
+
+                              The VM reads those same bytes back and builds two runtime ObjUpvalue objects pointing to stack slots 3 and 4.
+                              The closure's obj_upvalues vec ends up as [ref_to_upvalue_for_x, ref_to_upvalue_for_y].
+                              Later, when inner executes OP_GET_UPVALUE 0, the VM looks up obj_upvalues[0],
+                              follows it to the runtime upvalue, and reads the value from the stack (or from closed if it's been
+                              closed).
+                            *
+                             */
+                            let mut upvalues = Vec::new();
+                            for _ in 0..upvalue_count {
+                                let is_local = self.read_byte();
+                                let index = self.read_byte();
+                                if is_local == 1 {
+                                    /*
+                                    *
+                                    * The OP_CLOSURE is emitted at the end of a function declaration.
+                                    * At the moment the declaration is being done, the current function
+                                    * is the enclosing one. This means that the current function closure is
+                                    * stored in the top of the frame stack (current frame).
+                                    *
+                                     */
+                                    upvalues.push(self.capture_upvalue(self.current_frame().slots + index as usize));
+                                } else {
+                                    let closure = self.heap.get(self.current_frame().closure).as_closure();
+                                    upvalues.push(closure.obj_upvalues[index as usize]);
+                                }
+                            }
+                            self.heap.get_mut(closure_ref).as_closure_mut().obj_upvalues = upvalues;
+                        },
+                        _ => panic!("Expect a function as constant.")
+                    }
+                },
                 /*
                 * When a function returns, the return value is on the top of the stack.
                 * - The return value is popped from the stack. A
@@ -232,6 +355,51 @@ impl Vm {
                 Some(OpCode::OpReturn) => {
                     let result = self.stack.pop();
                     let frame = self.frames.pop().expect("Expect frame of the returning function.");
+                    /*
+                      OP_RETURN case
+
+                      fun outer() {
+                          var x = "hello";
+                          fun inner() { print x; }
+                          return inner;
+                      }
+
+                      var fn = outer();
+                      fn();
+
+                      When outer() returns, x is still a top-level local of outer — no block has ended,
+                      so OP_CLOSE_UPVALUE was never emitted for it. But outer's entire call frame is about to be
+                      discarded by OP_RETURN. The close_upvalues(frame.slots) call inside OP_RETURN catches x's upvalue
+                      and moves "hello" into it before the stack is truncated. Without this, fn()
+                      would read from a dead stack slot.
+
+                      OP_CLOSE_UPVALUE case
+
+                      fun outer() {
+                          var closure;
+                          {
+                              var x = "hello";
+                              fun inner() { print x; }
+                              closure = inner;
+                          }
+                          // x is gone here, but closure still needs it
+                          closure();
+                      }
+
+                      outer();
+
+                      Here x is declared inside a block within outer.
+                      When the } is reached, x goes out of scope — but outer hasn't returned yet.
+                      The compiler emits OP_CLOSE_UPVALUE for x at the end
+                      of that block. This closes the upvalue mid-function, moving "hello" into it.
+                      When closure() is called two lines later, the upvalue is already closed and carries its own value.
+
+                      If you only had the OP_RETURN path, the upvalue for x would remain open.
+                      The stack slot for x gets popped at }, and by the time closure() runs, that slot has been reused or is
+                      invalid.
+                    *
+                     */
+                    self.close_upvalues(frame.slots);
                     if self.frames.is_empty() {
                         self.stack.pop();
                         return Ok(())
@@ -432,6 +600,96 @@ impl Vm {
     }
 
     /*
+    * The linked list of upvalues is created in such a way to be sorted
+    * by descending slot index.
+    * Where the slot is the slot of the closed over variable on the stack
+    * the upvalue points to/contains.
+    * Consider this Lox code:
+    *
+    *  fun outer() {
+    *      var a = 1;  // slot 1
+    *      var b = 2;  // slot 2
+    *      var c = 3;  // slot 3
+    *
+    *      fun inner() { print a; print c; }
+    *  }
+    *
+    *  When inner captures a and c, the VM creates upvalues and inserts them into the linked list.
+    *  The list is maintained sorted by slot index descending, so:
+    *
+    *  head -> [slot 3] -> [slot 1] -> null
+    *
+    *  Now suppose a different closure wants to capture b (slot 2). The VM walks the list:
+    *
+    *  1. Look at head: slot 3 — that's above slot 2, keep walking.
+    *  2. Look at next: slot 1 — that's below slot 2.
+    *
+    *  At this point you stop. You know slot 2 isn't in the list because you've passed the point where it would be.
+    *  If it existed, it would be between slot 3 and slot 1. You don't need
+    *  to check the rest of the list. You insert a new upvalue for slot 2 right here:
+    *
+    *  head -> [slot 3] -> [slot 2] -> [slot 1] -> null
+    *
+    *  Without sorting, you'd have to walk the entire list every time to confirm an upvalue doesn't exist.
+    *  The same logic applies to close_upvalues(slot).
+    *  When a scope ends (say at slot 2), you walk from the head and close every upvalue with location >= 2.
+    *  The moment you hit one with location < 2, you stop — everything after it is guaranteed to be even lower.
+    *
+    *
+     */
+    fn capture_upvalue(&mut self, index: usize) -> ObjRef {
+        let mut prev_upvalue: Option<ObjRef> = None;
+        let mut upvalue = self.upvalues;
+        while upvalue.is_some() {
+            let upvalue_object = self.heap.get(upvalue.unwrap()).as_upvalue();
+            if upvalue_object.location <= index {
+                break;
+            }
+            prev_upvalue = upvalue;
+            upvalue = upvalue_object.next;
+        }
+
+        if upvalue.is_some() {
+            let upvalue_object = self.heap.get(upvalue.unwrap()).as_upvalue();
+            // the local slot we stopped at is the one we are looking for
+            // an existing upvalue containing the closed over variable
+            // exists and can be returned
+            if upvalue_object.location == index {
+                return upvalue.unwrap();
+            }
+        }
+        let created_upvalue_objref = self.heap.alloc(HeapObj::Upvalue(ObjUpvalue::new(index)));
+        self.heap.get_mut(created_upvalue_objref).as_upvalue_mut().next = upvalue;
+
+        if prev_upvalue.is_none() {
+            self.upvalues = Some(created_upvalue_objref);
+        } else {
+            self.heap.get_mut(prev_upvalue.unwrap()).as_upvalue_mut().next = Some(created_upvalue_objref);
+        }
+        created_upvalue_objref
+    }
+
+    /*
+    *
+    * When a local variable goes out of scope (popped from the stack), any open upvalue pointing at
+    * that stack slot would become a dangling reference. close_upvalues(last) prevents
+    * this by walking the linked list and, for every open upvalue with location >= last,
+    * copying the stack value into the upvalue's closed field. From that point on, the upvalue is
+    * "closed" — it carries its own copy of the value and no longer depends on the stack.
+    *
+     */
+    fn close_upvalues(&mut self, last: usize) {
+        while self.upvalues.is_some() {
+            let upvalue_object = self.heap.get_mut(self.upvalues.unwrap()).as_upvalue_mut();
+            if upvalue_object.location < last {
+                break
+            }
+            upvalue_object.closed = Some(self.stack[upvalue_object.location]);
+            self.upvalues = upvalue_object.next;
+        }
+    }
+
+    /*
     * When this is called, on the stack (local stack) there is on the first slot
     * the name of the function, beneath all the arguments needed by it.
     * Using the arg_count is therefore possible to access the name of the function
@@ -440,7 +698,8 @@ impl Vm {
         match value {
             Obj(obj_ref) => {
                 match self.heap.get(obj_ref) {
-                    HeapObj::Function(_) => self.call(obj_ref, arg_count),
+                    //HeapObj::Function(_) => self.call(obj_ref, arg_count),
+                    HeapObj::Closure(_) => { self.call(obj_ref, arg_count) },
                     HeapObj::NativeFunction(native_fn) => {
                         let result = (native_fn.fun)(arg_count, &self.stack[arg_count as usize..self.stack.len()]);
                         self.stack.truncate(arg_count as usize + 1);
@@ -462,10 +721,8 @@ impl Vm {
     * pushing it into the stack of frames.
      */
     fn call(&mut self, obj_ref: ObjRef, arg_count: u8) -> bool {
-        let arity = match self.heap.get(obj_ref) {
-            HeapObj::Function(obj_function) => obj_function.arity,
-            _ => panic!("Not a function")
-        };
+        let closure = self.heap.get(obj_ref).as_closure();
+        let arity = self.heap.get(closure.obj_function).as_function().arity;
 
         if arity != arg_count as usize {
             self.runtime_error(&format!("Expected {} arguments but got {}", arity, arg_count));
@@ -475,7 +732,8 @@ impl Vm {
         // NOTE: I AVOIDED CHECKING ON THE MAXIMUM STACK FRAMES SIZE
 
         let frame = CallFrame {
-            function: obj_ref,
+            //function: obj_ref,
+            closure: obj_ref,
             ip: Cell::new(0),
             // the start of the slots for that frame
             // the -1 is because the slot 0 is reserved for methods by the compiler.
@@ -513,10 +771,8 @@ impl Vm {
     fn get_current_chunk(&self) -> &Chunk {
         let last = self.frames.len() - 1;
         let frame = &self.frames[last];
-        match self.heap.get(frame.function) {
-            HeapObj::Function(obj_function) => &obj_function.chunk,
-            _ => panic!("Expected function")
-        }
+        let closure = self.heap.get(frame.closure).as_closure();
+        &self.heap.get(closure.obj_function).as_function().chunk
     }
 
     fn current_frame(&self) -> &CallFrame {
@@ -577,21 +833,15 @@ impl Vm {
         // the call stack is shown from the most recently called
         // function to the first called function
         for frame in self.frames.iter().rev() {
-            match self.heap.get(frame.function) {
-                HeapObj::Function(obj_function) => {
-                    let line = obj_function.chunk.get_lines()[frame.ip.get() - 1];
-                    eprint!("[line {}] in ", line);
-                    match obj_function.name {
-                        Some(name_ref) => {
-                            match self.heap.get(name_ref) {
-                                HeapObj::String(name) => eprintln!("{}()", name.chars),
-                                _ => ()
-                            }
-                        },
-                        None => eprintln!("script")
-                    }
+            let closure = self.heap.get(frame.closure).as_closure();
+            let obj_function = self.heap.get(closure.obj_function).as_function();
+            let line = obj_function.chunk.get_lines()[frame.ip.get() - 1];
+            eprint!("[line {}] in ", line);
+            match obj_function.name {
+                Some(name_ref) => {
+                    eprintln!("{}()", self.heap.get(name_ref).as_string().chars)
                 },
-                _ => panic!("Must be a function.")
+                None => eprintln!("script")
             }
         }
         let frame = self.current_frame();

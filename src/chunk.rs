@@ -36,7 +36,11 @@ pub enum OpCode {
     OpJump = 21,
     OpLoop = 22,
     OpReturn = 23,
-    OpCall = 24
+    OpCall = 24,
+    OpClosure = 25,
+    OpGetUpValue = 26,
+    OpSetUpValue = 27,
+    OpCloseUpValue = 28
 }
 
 impl OpCode {
@@ -67,6 +71,10 @@ impl OpCode {
             22 => Some(OpCode::OpLoop),
             23 => Some(OpCode::OpReturn),
             24 => Some(OpCode::OpCall),
+            25 => Some(OpCode::OpClosure),
+            26 => Some(OpCode::OpGetUpValue),
+            27 => Some(OpCode::OpSetUpValue),
+            28 => Some(OpCode::OpCloseUpValue),
             _ => None
         }
     }

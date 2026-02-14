@@ -7,7 +7,6 @@ need to be stored somewhere in the chunks. Where?
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
 use crate::heap::{Heap, HeapObj, ObjRef};
-use std::fmt::Display;
 /*
 The Lox values in memory are stored in two ways:
  - On the Stack, if the data type is small and immutable.
@@ -30,19 +29,23 @@ impl Value {
                 match heap.get(*obj_ref) {
                     HeapObj::String(string) => print!("{}", string.chars),
                     HeapObj::Function(func) => { self.display_function(func.name, heap) },
-                    HeapObj::NativeFunction(native_func) => { self.display_function(native_func.name, heap) }
+                    HeapObj::NativeFunction(native_func) => { self.display_function(native_func.name, heap) },
+                    HeapObj::Closure(closure) => { self.display_closure(&closure.obj_function, heap) },
+                    HeapObj::Upvalue(_) => print!("upvalue")
                 }
             },
             Value::Nil => print!("nil")
         }
     }
 
+    fn display_closure(&self, obj_ref: &ObjRef, heap: &Heap) {
+        self.display_function(heap.get(*obj_ref).as_function().name, heap)
+    }
+
     fn display_function(&self, obj_ref: Option<ObjRef>, heap: &Heap) {
         match obj_ref {
             Some(obj_ref) => {
-                if let HeapObj::String(string) = heap.get(obj_ref) {
-                    print!("<fn {}>", string.chars)
-                }
+                print!("<fn {}>", heap.get(obj_ref).as_string().chars)
             },
             None => print!("<script>")
         }

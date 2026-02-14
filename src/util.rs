@@ -1,6 +1,7 @@
 use crate::chunk::{Chunk, OpCode};
 use crate::heap::Heap;
 use crate::scanner::{Token, TokenType};
+use crate::value::Value;
 
 // Error handling
 pub struct Error {
@@ -28,11 +29,11 @@ pub fn disassemble_chunk(chunk: &Chunk, name: &str, heap: &Heap) {
     while offset < chunk.get_code().len() {
         // instructions have different size (number of bytes) therefore
         // the offset is computed when disassembling the instruction itself.
-        offset = disassemble_instruction(chunk, &offset, heap);
+        offset = disassemble_instruction(chunk, &mut offset, heap);
     }
 }
 
-pub fn disassemble_instruction(chunk: &Chunk, offset: &usize, heap: &Heap) -> usize {
+pub fn disassemble_instruction(chunk: &Chunk, offset: &mut usize, heap: &Heap) -> usize {
     print!("{:04}", offset);
     // a single line of lox source code, can correspond to several bytecode instructions,
     // '|' is used to mark a bytecode instruction that belongs to the same source code line
@@ -69,6 +70,35 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &usize, heap: &Heap) -> us
         Some(OpCode::OpJump) => jump_instruction("OP_JUMP", 1, chunk, offset),
         Some(OpCode::OpLoop) => jump_instruction("OP_LOOP", -1, chunk, offset),
         Some(OpCode::OpCall) => byte_instruction("OP_CALL", chunk, offset),
+        Some(OpCode::OpClosure) => {
+            *offset = *offset + 1;
+            let constant = chunk.get_code()[*offset] as usize;
+            *offset = *offset + 1;
+            print!("    {:16} {:4}", "OP_CLOSURE", constant);
+            chunk.get_constants().get_value(constant).print_value(heap);
+            print!("\n");
+            match chunk.get_constants().get_value(constant) {
+                Value::Obj(obj_ref) => {
+                    let obj_function = heap.get(*obj_ref).as_function();
+                    for i in 0..obj_function.upvalue_count {
+                        let is_local = chunk.get_code()[*offset];
+                        *offset += 1;
+                        let index = chunk.get_code()[*offset];
+                        *offset += 1;
+                        println!("{:04}      |                     {} {}",
+                                 *offset - 2,
+                                 if is_local == 1 { "local" } else { "upvalue" },
+                                 index
+                        );
+                    }
+                },
+                _ => panic!("Must be a obj ref.")
+            }
+            *offset
+        },
+        Some(OpCode::OpGetUpValue) => byte_instruction("OP_GET_UPVALUE", chunk, offset),
+        Some(OpCode::OpSetUpValue) => byte_instruction("OP_SET_UPVALUE", chunk, offset),
+        Some(OpCode::OpCloseUpValue) => simple_instruction("OP_CLOSE_UPVALUE", offset),
         None => {
             println!("Unknown opcode: {}", byte);
             *offset + 1

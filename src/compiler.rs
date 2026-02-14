@@ -2,11 +2,12 @@ use crate::chunk::{Chunk, OpCode};
 use crate::compiler::Precedence::PrecedenceAssignment;
 use crate::heap::{Heap, HeapObj, ObjRef};
 use crate::object::FunctionType::TypeFunction;
-use crate::object::{FunctionType, ObjFunction};
+use crate::object::{FunctionType, ObjFunction, CompilerUpvalue};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
 use crate::value::Value::Obj;
 use std::collections::HashMap;
+use std::cell::RefCell;
 use std::mem::replace;
 
 // values put in increasing order of precedence
@@ -95,14 +96,25 @@ To resolve the local variables, we will emit a bytecode instruction with operand
  */
 struct Local<'a> {
     name: Token<'a>,
-    depth: Option<usize>
+    depth: Option<usize>,
+    /*
+    *
+    * It is needed so that a certain compiler knows if it's variables are
+    * captured by some closures in inner functions. If that is the case
+    * this field will be useful to understand when a variable goes out of scope
+    * (no more referenced) if only removing it from the stack (OP_POP) or instead
+    * moving it to the heap to make it available for the closures when they need it.
+    *
+     */
+    is_captured: bool
 }
 
 impl<'a> Local<'a> {
     fn new(name: Token<'a>, depth: Option<usize>) -> Self {
         Local {
             name,
-            depth
+            depth,
+            is_captured: false
         }
     }
 }
@@ -117,7 +129,8 @@ struct Compiler<'a> {
     locals: Vec<Local<'a>>,
     local_count: u8,
     scope_depth: usize, // number of blocks surrounding the current code we are compiling.
-    enclosing: Option<Box<Compiler<'a>>>
+    enclosing: Option<Box<RefCell<Compiler<'a>>>>,
+    upvalues: Vec<CompilerUpvalue>
 }
 
 impl<'a> Compiler<'a> {
@@ -127,7 +140,8 @@ impl<'a> Compiler<'a> {
         locals.push(
             Local {
                 name: Token::new(""),
-                depth: Some(0)
+                depth: Some(0),
+                is_captured: false
             }
         );
 
@@ -143,7 +157,148 @@ impl<'a> Compiler<'a> {
             locals,
             local_count: 1,
             scope_depth: 0,
-            enclosing: None
+            enclosing: None,
+            upvalues: Vec::new()
+        }
+    }
+
+    /*
+    The trick is a 1 to 1 matching between the index of a local variable added in self.compiler.locals
+    and the index of the value for that local variable in self.stack in the Vm struct.
+    In fact, when a local variable is declared, we add it in the self.compiler.locals,
+    the value for that local variable is in the stack according to this:
+       {
+        var a = 1 + 2;
+        var b = 4;
+       }
+     stack: OP_CONSTANT 1
+     stack: OP_CONSTANT 1   2
+     stack: OP_ADD      3 // can be used to define local var a
+     stack: OP_CONSTANT 3   4 // can be used to define local var b
+    NOTE: The values on the stack needed to resolve an expression are pushed and popped in the expression lifetime, therefore they
+    don't interfere with the index of the value for that variable in the stack.
+     */
+    fn resolve_local(&self, name: &str) -> Result<Option<u8>, ()> {
+        for i in (0..self.local_count).rev() {
+            if let Some(local) = self.locals.get(i as usize) {
+                if local.name.get_lexeme() == name {
+                    if local.depth.is_none() {
+                        return Err(()); // signal error: can't read in own initializer
+                    }
+                    return Ok(Some(i));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn add_upvalue(&mut self, index: u8, is_local: bool) -> Option<u8> {
+        let function = self.function.as_mut()?;
+        let upvalue_count = function.upvalue_count;
+        /*
+        * If the function already has an upvalue for that variable
+        * because it refers to that variable multiple times, the index in the upvalues array
+        * is directly returned.
+        * Otherwise, it that's not the case it means that the upvalue is new and is added in the array
+         */
+        for i in 0..upvalue_count {
+            let upvalue = &self.upvalues[i];
+            if upvalue.index == index && upvalue.is_local == is_local {
+                return Some(i as u8);
+            }
+        }
+        self.upvalues[upvalue_count].is_local = is_local;
+        self.upvalues[upvalue_count].index = index;
+        function.upvalue_count += 1;
+        Some(upvalue_count as u8)
+    }
+
+    /*
+    * Upvalues is the mechanism used to allow a function to refer to variables
+    * which are local to outer (previous) functions.
+    * Indeed, one common strategy is to move to the heap closed-over local variables
+    * so that later functions who need those can find them in the heap.
+    * However, the compiler implemented is a single pass compiler, therefore there is
+    * no way for the compiler to go back to already compiled variables to move to the heap
+    * when it becomes aware that these variables are closed-over.
+    * Every closure has an array of upvalues assigned.
+    * Such array captures the local variables of other functions on which the closure (function)
+    * closes over.
+    * In particular the upvalue points to the location on the stack where such variable lives.
+    *
+    *                    ----------------> ObjFunction (chunk, constants)
+    * ObjClosure (function, upvalues)
+    *                               -----------------> Upvalue array ----> ObjUpvalue (location)
+    *                              < --------------------------------------------------------
+    *                             3     <fn>
+    *
+    * Given the following example:
+    * {
+    *   var a = 3;
+    *   fun f() {
+    *     print(a)
+    *   }
+    * }
+    *
+    * Question: The approach of giving to the functions a relative stack slot offset of the variables in outer
+    * functions does not work. This is because when the enclosing function does not execute anymore (returns) its
+    * stack slots are popped from the stack, therefore these offsets are meaningless.
+    * One could argue, what is the difference with upvalues then, they also take an index which is the position
+    * of the closed over variables on the stack.
+    * The difference is that this is only the initial state. When the enclosing function is about to return, the VM
+    * copies the value from the stack into the upvalue object itself (on the heap).
+    * The upvalue is just an indirection layer.
+     */
+    fn resolve_upvalues(&mut self, name: &str) -> Result<Option<u8>, ()> {
+        if self.enclosing.is_none() {
+            return Ok(None);
+        }
+
+        let local_result = {
+            let enclosing = self.enclosing.as_ref().unwrap();
+            let enclosing_ref = enclosing.borrow();
+            enclosing_ref.resolve_local(name)
+        };
+
+        match local_result {
+            Ok(Some(index)) => {
+                let enclosing = self.enclosing.as_ref().unwrap();
+                enclosing.borrow_mut().locals[index as usize].is_captured = true;
+                Ok(self.add_upvalue(index, true))
+            }
+            /*
+            *
+            * Why a recursive case is needed?
+            * When a function closes over a variable not in the
+            * immediately outer function but in functions in outer levels,
+            * the closed over variable is removed from the stack before the
+            * upvalue is able to capture it. The idea then is to create a chain
+            * of upvalues until the upvalue in the function before the closed-over variable.
+            * Meaning, given this example:
+            * f() {
+            *   var x = ...
+            *   g() {
+            *      h() {
+            *         use x
+            *      }
+            *   }
+            * }
+            * Then h(upvalue) ---> g(upvalue) ----> f(var x)
+            * And h reaches var x via the chain of upvalues.
+            *
+             */
+            Ok(None) => {
+                let upvalue = {
+                    let enclosing = self.enclosing.as_ref().unwrap();
+                    let mut enclosing_mut = enclosing.borrow_mut();
+                    enclosing_mut.resolve_upvalues(name)?
+                };
+                match upvalue {
+                    Some(index) => Ok(self.add_upvalue(index, false)),
+                    None => Ok(None)
+                }
+            }
+            Err(()) => Err(())
         }
     }
 }
@@ -507,7 +662,7 @@ impl<'a> Parser<'a> {
         let mut compiler = Compiler::new();
         compiler.type_fn = function_type;
         let enclosing_compiler = replace(self.compiler.as_mut(), compiler);
-        self.compiler.enclosing = Some(Box::from(enclosing_compiler));
+        self.compiler.enclosing = Some(Box::new(RefCell::new(enclosing_compiler)));
         if function_type != FunctionType::TypeScript {
             let name = self.heap.intern_string(self.previous.get_lexeme().to_string());
             self.compiler.function.as_mut().expect("Expect current function").name = Some(name);
@@ -534,9 +689,19 @@ impl<'a> Parser<'a> {
 
         self.block();
         let function = self.end_compiler();
+        let upvalue_count = function.upvalue_count;
         let obj_ref = self.heap.alloc(HeapObj::Function(function));
         let constant = self.make_constant(Obj(obj_ref));
-        self.emit_bytes(OpCode::OpConstant.to_u8(), constant)
+        //self.emit_bytes(OpCode::OpConstant.to_u8(), constant)
+        self.emit_bytes(OpCode::OpClosure.to_u8(), constant);
+        for i in 0..upvalue_count {
+            if self.compiler.upvalues[i].is_local {
+                self.emit_byte(1);
+            } else {
+                self.emit_byte(0);
+            }
+            self.emit_byte(self.compiler.upvalues[i].index)
+        }
     }
 
     /*
@@ -795,15 +960,37 @@ impl<'a> Parser<'a> {
         let get_op: u8;
         let set_op: u8;
 
-        let mut arg = self.resolve_local();
+        let name = self.previous.get_lexeme().to_string();
+        let mut arg = match self.compiler.resolve_local(&name) {
+            Ok(result) => result,
+            Err(()) => {
+                self.error("Can't read local variable in its own initializer.");
+                None
+            }
+        };
 
         if arg.is_some() {
             get_op = OpCode::OpGetLocal.to_u8();
             set_op = OpCode::OpSetLocal.to_u8();
         } else {
-            arg = Some(self.identifier_constant());
-            get_op = OpCode::OpGetGlobal.to_u8();
-            set_op = OpCode::OpSetGlobal.to_u8();
+            // if the local variable is not found in the inner scope
+            // is searched in all the outer scoped functions
+            // only in the last case it looks in the global scope
+            arg = match self.compiler.resolve_upvalues(&name) {
+                Ok(result) => result,
+                Err(()) => {
+                    self.error("Can't read local variable in its own initializer.");
+                    None
+                }
+            };
+            if arg.is_some() {
+                get_op = OpCode::OpGetUpValue.to_u8();
+                set_op = OpCode::OpSetUpValue.to_u8();
+            } else {
+                arg = Some(self.identifier_constant());
+                get_op = OpCode::OpGetGlobal.to_u8();
+                set_op = OpCode::OpSetGlobal.to_u8();
+            }
         }
 
         /*
@@ -821,36 +1008,6 @@ impl<'a> Parser<'a> {
         } else {
             self.emit_bytes(get_op, arg_value);
         }
-    }
-
-    /*
-    The trick is a 1 to 1 matching between the index of a local variable added in self.compiler.locals
-    and the index of the value for that local variable in self.stack in the Vm struct.
-    In fact, when a local variable is declared, we add it in the self.compiler.locals,
-    the value for that local variable is in the stack according to this:
-       {
-        var a = 1 + 2;
-        var b = 4;
-       }
-     stack: OP_CONSTANT 1
-     stack: OP_CONSTANT 1   2
-     stack: OP_ADD      3 // can be used to define local var a
-     stack: OP_CONSTANT 3   4 // can be used to define local var b
-    NOTE: The values on the stack needed to resolve an expression are pushed and popped in the expression lifetime, therefore they
-    don't interfere with the index of the value for that variable in the stack.
-     */
-    fn resolve_local(&mut self) -> Option<u8> {
-        for i in (0..self.compiler.local_count).rev() {
-            if let Some(local) = self.compiler.locals.get(i as usize) {
-                if local.name.get_lexeme() == self.previous.get_lexeme() {
-                    if local.depth.is_none() {
-                        self.error("Can't read local variable in its own initializer.");
-                    }
-                    return Some(i);
-                }
-            }
-        }
-        None
     }
 
     /*
@@ -924,8 +1081,21 @@ impl<'a> Parser<'a> {
             if local.depth.expect("Local depth is not initialized.") <= self.compiler.scope_depth {
                 break;
             }
-            // local variables values occupy slots in the stack so when it goes out of scope the value is popped
-            self.emit_byte(OpCode::OpPop.to_u8());
+            /*
+            *
+            * If a variable in the function is captured by some other function
+            * then when is going out of scope, it cannot be simply removed from the
+            * stack anymore, otherwise the function closing over it won't be able to find it.
+            * Instead, the variable needs to be moved from the stack to the heap.
+            * The OP_CLOSE_UPVALUE opcode signals to the runtime exactly this.
+            *
+             */
+            if self.compiler.locals[(self.compiler.local_count - 1) as usize].is_captured {
+                self.emit_byte(OpCode::OpCloseUpValue.to_u8())
+            } else {
+                // local variables values occupy slots in the stack so when it goes out of scope the value is popped
+                self.emit_byte(OpCode::OpPop.to_u8());
+            }
             self.compiler.local_count -= 1;
             self.compiler.locals.pop();
         }
@@ -1250,13 +1420,9 @@ impl<'a> Parser<'a> {
     fn end_compiler(&mut self) -> ObjFunction {
         #[cfg(feature = "debug-trace-execution")]
         {
-            let function_name = if let Some(name) = self.compiler.function.name {
-                match self.heap.get(name) {
-                    Obj::String(value) => &value.chars,
-                    _ => "script"
-                }
-            } else {
-                "script"
+            let function_name = match self.compiler.function.as_ref().and_then(|f| f.name) {
+                Some(name) => &self.heap.get(name).as_string().chars,
+                None => "script"
             };
             if !self.had_error {
                 disassemble_chunk(self.current_chunk(), function_name, &self.heap);
@@ -1265,7 +1431,7 @@ impl<'a> Parser<'a> {
         self.emit_return();
         let function = self.compiler.function.take().expect("Valid function.");
         if let Some(enclosing) = self.compiler.enclosing.take() {
-            self.compiler = enclosing;
+            self.compiler = Box::new(enclosing.into_inner());
         }
         function
     }
