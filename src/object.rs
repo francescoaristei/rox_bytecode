@@ -125,6 +125,7 @@ impl ObjClosure {
     }
 }
 
+#[derive(Clone)]
 pub struct CompilerUpvalue {
     pub index: u8,
     pub is_local: bool

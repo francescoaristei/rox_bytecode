@@ -5,5 +5,7 @@ edition = "2024"
 
 [features]
 debug-trace-execution = []
+debug-gc = []
+debug-log-gc = []
 
 [dependencies]

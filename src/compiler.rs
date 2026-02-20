@@ -207,8 +207,7 @@ impl<'a> Compiler<'a> {
                 return Some(i as u8);
             }
         }
-        self.upvalues[upvalue_count].is_local = is_local;
-        self.upvalues[upvalue_count].index = index;
+        self.upvalues.push(CompilerUpvalue::new(index, is_local));
         function.upvalue_count += 1;
         Some(upvalue_count as u8)
     }
@@ -688,6 +687,7 @@ impl<'a> Parser<'a> {
         self.consume(TokenType::LeftBrace, "Expect '{' before function body.");
 
         self.block();
+        let upvalues = self.compiler.upvalues.clone();
         let function = self.end_compiler();
         let upvalue_count = function.upvalue_count;
         let obj_ref = self.heap.alloc(HeapObj::Function(function));
@@ -695,12 +695,12 @@ impl<'a> Parser<'a> {
         //self.emit_bytes(OpCode::OpConstant.to_u8(), constant)
         self.emit_bytes(OpCode::OpClosure.to_u8(), constant);
         for i in 0..upvalue_count {
-            if self.compiler.upvalues[i].is_local {
+            if upvalues[i].is_local {
                 self.emit_byte(1);
             } else {
                 self.emit_byte(0);
             }
-            self.emit_byte(self.compiler.upvalues[i].index)
+            self.emit_byte(upvalues[i].index)
         }
     }
 

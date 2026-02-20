@@ -119,6 +119,10 @@ impl Chunk {
         &self.constants
     }
 
+    pub fn constants_len(&self) -> usize {
+        self.constants.get_values().len()
+    }
+
     pub fn write(&mut self, byte: u8, line: usize) {
         self.code.push(byte);
         self.lines.push(line);

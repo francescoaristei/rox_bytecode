@@ -7,6 +7,7 @@ need to be stored somewhere in the chunks. Where?
 - Create a pool of constants and store everything there for a chunk (JVM does this with compiled classes) -> clox adopt this solution.
  */
 use crate::heap::{Heap, HeapObj, ObjRef};
+use crate::value::Value::Obj;
 /*
 The Lox values in memory are stored in two ways:
  - On the Stack, if the data type is small and immutable.
@@ -57,6 +58,13 @@ impl Value {
             _ => false
         }
     }
+    
+    pub fn as_obj(&self) -> Option<ObjRef> {
+        match self { 
+            Obj(obj_ref) => Some(*obj_ref),
+            _ => None
+        }
+    }
 
     pub fn as_string<'a>(&self, heap: &'a Heap) -> Option<&'a str> {
         match self {
@@ -98,6 +106,10 @@ impl Values {
     pub fn push_value(&mut self, value: Value) -> usize {
         self.values.push(value);
         self.values.len() - 1
+    }
+
+    pub fn get_values(&self) -> &Vec<Value> {
+        &self.values
     }
 
     pub fn get_value(&self, index: usize) -> &Value {

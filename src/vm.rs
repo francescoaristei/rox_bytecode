@@ -162,17 +162,53 @@ impl Vm {
         if function.is_none() {
             return Err(Error::InterpretCompilerError);
         }
-        let obj_function_ref = self.heap.alloc(HeapObj::Function(function.unwrap()));
-        let closure = ObjClosure::new(obj_function_ref);
-        let obj_function_closure = self.heap.alloc(HeapObj::Closure(closure));
-        self.stack.push(Obj(obj_function_closure));
-        /*self.frames.push(
-            CallFrame {
-                function: obj_ref,
-                ip: Cell::new(0),
-                slots: 0
+        /*
+         * Compiler roots problem.
+         *
+         * The compiler allocates strings on the VM heap during compilation (via heap.intern_string()),
+         * storing ObjRefs in the function's constant pool and name field. These strings are only
+         * referenced from the ObjFunction, which at this point is still a Rust local variable —
+         * not yet on the VM heap, and therefore invisible to the GC.
+         *
+         * When alloc(Function) is called, debug-gc mode triggers a collection *before* the function
+         * is placed on the heap. The GC cannot see the Rust-local ObjFunction, so it has no way to
+         * reach the strings in its constant pool. Those strings are swept, leaving the function
+         * with dangling ObjRefs.
+         *
+         * The fix: before calling alloc(Function), push all ObjRefs the function holds (its name
+         * and every Obj constant) onto the VM stack as temporary roots. The GC traverses the stack
+         * during mark_roots(), so these strings will be kept alive. Once the function is safely on
+         * the heap and itself rooted, we pop the temporaries.
+         *
+         * In normal execution this is harmless — GC won't trigger this early given the 1MB
+         * threshold — but it makes debug-gc stress mode correct too.
+         *
+         * Note: in clox the equivalent fix is markCompilerRoots(), which walks the live compiler
+         * chain and marks each in-progress ObjFunction. Here compilation is already finished by
+         * the time we call alloc(), so pushing constants directly is simpler.
+         */
+        let function = function.unwrap();
+        let temp_root_count = {
+            let constants = function.chunk.get_constants().get_values();
+            let obj_constants: Vec<ObjRef> = constants.iter().filter_map(|v| v.as_obj()).collect();
+            let count = obj_constants.len() + function.name.is_some() as usize;
+            for obj_ref in obj_constants {
+                self.stack.push(Obj(obj_ref));
             }
-        );*/
+            if let Some(name_ref) = function.name {
+                self.stack.push(Obj(name_ref));
+            }
+            count
+        };
+        let obj_function_ref = self.alloc(HeapObj::Function(function));
+        for _ in 0..temp_root_count {
+            self.stack.pop();
+        }
+        self.stack.push(Obj(obj_function_ref)); // temp root: keeps the Function reachable if GC runs inside alloc(Closure)
+        let closure = ObjClosure::new(obj_function_ref);
+        let obj_function_closure = self.alloc(HeapObj::Closure(closure));
+        self.stack.pop();
+        self.stack.push(Obj(obj_function_closure));
         self.call(obj_function_closure, 0);
         self.run()
     }
@@ -249,7 +285,14 @@ impl Vm {
                         Obj(obj_ref) => {
                             let upvalue_count = self.heap.get(obj_ref).as_function().upvalue_count;
                             let obj_closure = ObjClosure::new(obj_ref);
-                            let closure_ref = self.heap.alloc(HeapObj::Closure(obj_closure));
+                            /*
+                            * Need to push the Function's ObjRef onto the stack before allocating the Closure, to keep it
+                            * rooted during GC — then pop it after. This is the same technique clox uses.
+                            * Inside the OpClosure dispatch, where a function constant is wrapped in a closure at runtime.
+                             */
+                            self.stack.push(Obj(obj_ref)); // temp root: keeps the Function reachable if GC runs inside alloc
+                            let closure_ref = self.alloc(HeapObj::Closure(obj_closure));
+                            self.stack.pop();
                             self.stack.push(Obj(closure_ref));
 
                             /*
@@ -423,7 +466,7 @@ impl Vm {
                     match (a.as_string(&self.heap), b.as_string(&self.heap)) {
                         (Some(a_str), Some(b_str)) => {
                             let ab = format!("{}{}", b_str, a_str);
-                            let handle = self.heap.intern_string(ab);
+                            let handle = self.intern_string(ab);
                             self.stack.pop();
                             self.stack.pop();
                             self.stack.push(Obj(handle))
@@ -658,7 +701,7 @@ impl Vm {
                 return upvalue.unwrap();
             }
         }
-        let created_upvalue_objref = self.heap.alloc(HeapObj::Upvalue(ObjUpvalue::new(index)));
+        let created_upvalue_objref = self.alloc(HeapObj::Upvalue(ObjUpvalue::new(index)));
         self.heap.get_mut(created_upvalue_objref).as_upvalue_mut().next = upvalue;
 
         if prev_upvalue.is_none() {
@@ -819,13 +862,175 @@ impl Vm {
 
     fn define_native(&mut self, name: &str, fun: NativeFn) {
         // intern the name of the native function and get the obj ref
-        let name_handle = self.heap.intern_string(name.to_string());
+        let name_handle = self.intern_string(name.to_string());
         // allocate the native function on the heap and get the obj ref
         let obj_native = ObjNativeFunction::new(fun);
-        let fun_handle = self.heap.alloc(HeapObj::NativeFunction(obj_native));
+        let fun_handle = self.alloc(HeapObj::NativeFunction(obj_native));
         // insert in the globals as key the obj ref of the interned string and as key the Obj having
         // value the obj ref of the native function on the heap
         self.globals.insert(name_handle, Obj(fun_handle));
+    }
+
+    fn alloc(&mut self, object: HeapObj) -> ObjRef {
+        #[cfg(feature = "debug-gc")]
+        {
+            self.collect_garbage();
+        }
+
+        #[cfg(feature = "debug-log-gc")]
+        let type_name = object.type_name();
+
+        if self.heap.get_bytes_allocated() > self.heap.get_next_gc() {
+            self.collect_garbage();
+        }
+
+        let obj_ref = self.heap.alloc(object);
+
+        #[cfg(feature = "debug-log-gc")]
+        println!("{:?} allocate {}", obj_ref, type_name);
+
+        obj_ref
+    }
+
+    fn intern_string(&mut self, string: String) -> ObjRef {
+        self.heap.intern_string(string)
+    }
+
+    /*
+    * Garbage Collector
+    * The garbage collector (gc) is that part of the compiler which cleans automatically memory when
+    * possible without having the programming language (Lox) think about it.
+    * In order for the gc to do so, it needs to know which memory is possible to free.
+    * Every value defined in a program falls under two categories:
+    *   - reachable
+    *   - unreachable
+    * A value is reachable if there is some way for the user program to 'reference' it.
+    * The work of the gc is to understand which value is not reachable anymore by the
+    * executing program and to deallocate it, freeing memory.
+    * Every value can be divided further into two categories:
+    *   - root
+    *   - non-root
+    * A root value, is any object that the VM can reach without having to go through a reference in
+    * some other object.
+    * Examples of root objects are: local variables, global variables (accessible from the
+    * global table), variables sitting on the stack.
+    * To understand non-root cases lets see an example.
+    *
+    * fun makeClosure() {
+    *   var a = "data";
+    *
+    *    fun f() { print a; }
+    *      return f;
+    *     }
+    *
+    * {
+    *   var closure = makeClosure();
+    *   // GC here.
+    *   closure();
+    *  }
+    *
+    * When executed the program prints "data".
+    * The "data" string is not on the stack.
+    * To access it is the following:
+    * ObjClosure -> upvalues -> upvalues[0] -> ObjUpvalue -> closed -> ObjString -> "data"
+    *
+    * Variable closure is on the stack, but to get to the string, is required to pass through its
+    * upvalues array.
+    * Therefore, also "data" is reachable.
+    * It follows an inductive definition of reachability:
+    *   - All roots are reachable
+    *   - Any object referred by a reachable object is also reachable
+    *
+    * Any object which does not fall into this definition, is not reachable and is duty of the gc
+    * to remove it from memory.
+    * The basic idea of the algorithm is straightforward:
+    *   - Traverse all objects starting from the roots and put them in a set
+    *   * All objects not in that set need to be freed.
+    *
+    * Mark and Sweep
+    *   - Traverse the graph of all objects starting from the roots one and 'mark' them.
+    *   - Once the traversal is completed, sweep all objects not marked.
+    *
+     */
+    fn collect_garbage(&mut self) {
+        #[cfg(feature = "debug-log-gc")]
+        let before = self.heap.get_bytes_allocated();
+
+        #[cfg(feature = "debug-log-gc")]
+        println!("--gc begin");
+
+        self.mark_roots();
+        self.heap.trace_references();
+        self.heap.clear_strings();
+        self.heap.sweep();
+
+        // next_gc always has a minimum of 1024 * 1024 otherwise if gets to 0, then is always kept to 0 (0 * 2 = 0) and gc happens forever.
+        self.heap.set_next_gc((self.heap.get_bytes_allocated() * 2).max(1024 * 1024));
+
+        #[cfg(feature = "debug-log-gc")]
+        println!("--gc end");
+
+        #[cfg(feature = "debug-log-gc")]
+        println!(
+            "   collected {} bytes (from {} to {}) next at {}",
+            before - self.heap.get_bytes_allocated(),
+            before,
+            self.heap.get_bytes_allocated(),
+            self.heap.get_next_gc()
+        );
+    }
+
+    /*
+    * This implementation miss the markCompilerRoots() used in clox.
+    * This happens because heap-allocated objects are accessible only from the vm
+    * therefore is not possible to move the GC trigger in the heap itself.
+    * First compilation happens, then execution via VM and here is where GC operates.
+    * Therefore, the objects allocated by the compiler (string interning, ObjFunction allocated
+    * for each function being compiled) do not risk of being removed by the GC during compilation.
+    * However, this is not a problem as every object allocated by the compiler, referenced by the
+    * compiled program, ends up being cleaned by the GC once it becomes unreachable.
+    *
+     */
+    fn mark_roots(&mut self) {
+        for value in &self.stack {
+            /*
+            * Stack and global memory have deterministic lifetimes managed by the runtime
+            * Stack variables are allocated and freed automatically as functions are called and freed.
+            * Global variables need to live for the whole lifetime of the program.
+            * Heap memory is dynamically allocated at runtime with no predictable lifetime, the gc
+            * therefore, tracks which heap objects are still reachable and frees the ones that are not.
+             */
+            if let Some(obj_ref) = value.as_obj() {
+                self.heap.mark_object(obj_ref)
+            }
+        }
+
+        /*
+        * The VM mantains a separate stack of callframes, each call frame contains points to the closure being called
+        * The VM uses these pointers to access constants and upvalues, therefore the closures needs to be kept as well.
+         */
+        for frame in &self.frames {
+            self.heap.mark_object(frame.closure)
+        }
+
+        // also the open upvalues are objects that are directly reachable by the VM
+        let mut upvalue = self.upvalues;
+        while let Some(upvalue_ref) = upvalue {
+            self.heap.mark_object(upvalue_ref);
+            let upvalue_obj = self.heap.get(upvalue_ref).as_upvalue();
+            upvalue = upvalue_obj.next;
+        }
+
+        self.mark_globals();
+    }
+
+    fn mark_globals(&mut self) {
+        for obj_ref in self.globals.keys() {
+            self.heap.mark_object(*obj_ref);
+            if let Some(obj_ref) = self.globals[obj_ref].as_obj() {
+                self.heap.mark_object(obj_ref);
+            }
+        }
     }
 
     fn runtime_error(&self, messages: &str) -> Error {
