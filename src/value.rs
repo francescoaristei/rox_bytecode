@@ -26,16 +26,34 @@ impl Value {
         match self { 
             Value::Number(number) => print!("{}", number),
             Value::Boolean(bool) => print!("{}", bool),
-            Value::Obj(obj_ref) => {
+            Obj(obj_ref) => {
                 match heap.get(*obj_ref) {
                     HeapObj::String(string) => print!("{}", string.chars),
                     HeapObj::Function(func) => { self.display_function(func.name, heap) },
                     HeapObj::NativeFunction(native_func) => { self.display_function(native_func.name, heap) },
                     HeapObj::Closure(closure) => { self.display_closure(&closure.obj_function, heap) },
-                    HeapObj::Upvalue(_) => print!("upvalue")
+                    HeapObj::Upvalue(_) => print!("upvalue"),
+                    HeapObj::Class(class) => { self.display_class(class.name, heap) },
+                    HeapObj::Instance(instance) => { self.display_instance(instance.klass, heap) }
                 }
             },
             Value::Nil => print!("nil")
+        }
+    }
+    
+    fn display_class(&self, obj_ref:Option<ObjRef>, heap: &Heap) {
+        match obj_ref { 
+            Some(obj_ref) => {
+                print!("{}", heap.get(obj_ref).as_string().chars)
+            },
+            None => {}
+        }
+    }
+
+    fn display_instance(&self, klass_ref: ObjRef, heap: &Heap) {
+        let class = heap.get(klass_ref).as_class();
+        if let Some(name_ref) = class.name {
+            print!("{} instance", heap.get(name_ref).as_string().chars);
         }
     }
 
@@ -68,7 +86,7 @@ impl Value {
 
     pub fn as_string<'a>(&self, heap: &'a Heap) -> Option<&'a str> {
         match self {
-            Value::Obj(obj_ref) => {
+            Obj(obj_ref) => {
                 match heap.get(*obj_ref) {
                     HeapObj::String(string) => {
                         Some(&string.chars)

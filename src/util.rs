@@ -99,6 +99,9 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &mut usize, heap: &Heap) -
         Some(OpCode::OpGetUpValue) => byte_instruction("OP_GET_UPVALUE", chunk, offset),
         Some(OpCode::OpSetUpValue) => byte_instruction("OP_SET_UPVALUE", chunk, offset),
         Some(OpCode::OpCloseUpValue) => simple_instruction("OP_CLOSE_UPVALUE", offset),
+        Some(OpCode::OpClass) => constant_instruction("OP_CLASS", chunk, offset, heap),
+        Some(OpCode::OpGetProperty) => constant_instruction("OP_GET_PROPERTY", chunk, offset, heap),
+        Some(OpCode::OpSetProperty) => constant_instruction("OP_SET_PROPERTY", chunk, offset, heap),
         None => {
             println!("Unknown opcode: {}", byte);
             *offset + 1

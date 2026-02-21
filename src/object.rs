@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::chunk::Chunk;
 use crate::heap::ObjRef;
 use crate::value::Value;
@@ -175,6 +176,34 @@ impl ObjUpvalue {
             location,
             next: None,
             closed: None
+        }
+    }
+}
+
+
+pub struct ObjClass {
+    pub name: Option<ObjRef>
+}
+
+impl ObjClass {
+    pub fn new(name: ObjRef) -> Self {
+        ObjClass {
+            name: Some(name)
+        }
+    }
+}
+
+
+pub struct ObjInstance {
+    pub klass: ObjRef,
+    pub fields: HashMap<ObjRef, Value>
+}
+
+impl ObjInstance {
+    pub fn new(klass: ObjRef) -> Self {
+        ObjInstance {
+            klass,
+            fields: HashMap::new()
         }
     }
 }

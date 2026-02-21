@@ -6,7 +6,10 @@ use crate::value::Value;
 use crate::value::Value::Obj;
 use std::cell::Cell;
 use std::collections::HashMap;
-use crate::object::{NativeFn, ObjClosure, ObjNativeFunction, ObjUpvalue};
+use std::fmt::format;
+use crate::chunk::OpCode::OpClass;
+use crate::object::{NativeFn, ObjClass, ObjClosure, ObjInstance, ObjNativeFunction, ObjUpvalue};
+use crate::vm::Error::InterpretRuntimeError;
 /*
 * Frame/Base Pointer:
 * How should the local variables of each function be allocated on the stack?
@@ -233,6 +236,72 @@ impl Vm {
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
             let instruction: u8 = self.read_byte();
             match OpCode::from_u8(instruction) {
+                Some(OpCode::OpGetProperty) => {
+                    // at this point of the interpreter flow, the expression on the left of the dot has alrready been
+                    // consumed and the instance is on the top of the stack
+                    let instance_ref = self.peek(0).as_obj().expect("Expect instance");
+
+                    let instance_obj = match self.heap.get(instance_ref).try_as_instance() {
+                        Some(v) => v,
+                        None => {
+                            return Err(self.runtime_error("Only instances have properties."));
+                        }
+                    };
+
+                    // the field name is read from the constant pool
+                    let property_name_ref = self.read_constant().as_obj().unwrap();
+                    let property_name = self.heap.get(property_name_ref).as_string();
+
+                    if let Some(value) = instance_obj.fields.get(&property_name_ref) {
+                        let value = *value;
+                        // the instance is popped
+                        self.stack.pop();
+                        self.stack.push(value);
+                    } else {
+                        return Err(self.runtime_error(&format!("Undefined property: {}", property_name.chars)));
+                    }
+                },
+                Some(OpCode::OpSetProperty) => {
+                    /*
+                    * When this executes, the top of the stack has the instance on which to set the value
+                    * and above it the value to set.
+                    * After reading the instruction operand to find the field name, the field name is used
+                    * to store the value on top of the stack in the instance field having that field name.
+                    * Then the stored value is popped from the stack, the instance is popped from the stack
+                    * and the field of the instance just set is pushed on the stack, as a setter returns
+                    * the assigned value.
+                    *
+                     */
+                    let instance_ref = self.peek(1).as_obj().expect("Expect instance");
+
+                    let property_name_ref = self.read_constant().as_obj().unwrap();
+
+                    let stored_value = *self.peek(0);
+
+                    let instance_obj = match self.heap.get_mut(instance_ref).try_as_mut_instance() {
+                        Some(v) => v,
+                        None => {
+                            return Err(self.runtime_error("Only instances have properties."));
+                        }
+                    };
+
+                    // the field name is read from the constant pool
+
+                    //let property_name = self.heap.get(property_name_ref).as_string();
+
+                    instance_obj.fields.insert(property_name_ref, stored_value);
+                    let value = self.stack.pop().unwrap();
+                    self.stack.pop();
+                    self.stack.push(value);
+                },
+                Some(OpCode::OpClass) => {
+                    if let Some(name) = self.read_constant().as_obj() {
+                        let class = ObjClass::new(name);
+                        let heap_class = HeapObj::Class(class);
+                        let class_ref = self.heap.alloc(heap_class);
+                        self.stack.push(Obj(class_ref))
+                    };
+                },
                 Some(OpCode::OpCloseUpValue) => {
                     self.close_upvalues(self.stack.len() - 1);
                     self.stack.pop();
@@ -742,6 +811,19 @@ impl Vm {
             Obj(obj_ref) => {
                 match self.heap.get(obj_ref) {
                     //HeapObj::Function(_) => self.call(obj_ref, arg_count),
+                    HeapObj::Class(obj_class) => {
+                      /*
+                      * If the value being called (the thing on the left of the parentheses)
+                      * is a class, then the calls is considered as a constructor call,
+                      * a new instance of that class is created and stored onto the stack
+                      *
+                       */
+                        let obj_instance = ObjInstance::new(obj_ref);
+                        let instance_ref = self.heap.alloc(HeapObj::Instance(obj_instance));
+                        let top_stack = self.stack.len() - 1 - arg_count as usize;
+                        self.stack[top_stack] = Obj(instance_ref);
+                        true
+                    },
                     HeapObj::Closure(_) => { self.call(obj_ref, arg_count) },
                     HeapObj::NativeFunction(native_fn) => {
                         let result = (native_fn.fun)(arg_count, &self.stack[arg_count as usize..self.stack.len()]);

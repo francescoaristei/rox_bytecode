@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::object::{ObjClosure, ObjFunction, ObjNativeFunction, ObjString, ObjUpvalue};
+use crate::object::{ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjNativeFunction, ObjString, ObjUpvalue};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ObjRef(usize);
@@ -10,7 +10,9 @@ pub enum HeapObj {
     Function(ObjFunction),
     NativeFunction(ObjNativeFunction),
     Closure(ObjClosure),
-    Upvalue(ObjUpvalue)
+    Upvalue(ObjUpvalue),
+    Class(ObjClass),
+    Instance(ObjInstance)
 }
 
 impl HeapObj {
@@ -21,6 +23,8 @@ impl HeapObj {
             HeapObj::NativeFunction(_) => "NativeFunction",
             HeapObj::Closure(_) => "Closure",
             HeapObj::Upvalue(_) => "Upvalue",
+            HeapObj::Class(_) => "Class",
+            HeapObj::Instance(_) => "Instance"
         }
     }
 
@@ -82,6 +86,36 @@ impl HeapObj {
         match self {
             HeapObj::Upvalue(v) => v,
             _ => panic!("Expected Upvalue")
+        }
+    }
+
+    pub fn as_class(&self) -> &ObjClass {
+        match self {
+            HeapObj::Class(v) => v,
+            _ => panic!("Expected Class")
+        }
+    }
+
+    pub fn as_mut_class(&mut self) -> &mut ObjClass {
+        match self {
+            HeapObj::Class(v) => v,
+            _ => panic!("Expected Class")
+        }
+    }
+
+    // for instances is required to cover the case in which a user
+    // tries to access a property on a non-instance e.g a string etc.
+    pub fn try_as_instance(&self) -> Option<&ObjInstance> {
+        match self {
+            HeapObj::Instance(v) => Some(v),
+            _ => None
+        }
+    }
+
+    pub fn try_as_mut_instance(&mut self) -> Option<&mut ObjInstance> {
+        match self {
+            HeapObj::Instance(v) => Some(v),
+            _ => None
         }
     }
 }
@@ -265,6 +299,15 @@ impl Heap {
                         )
                         .collect()
                 },
+                HeapObj::Class(class) => {
+                    class.name.into_iter().collect()
+                },
+                HeapObj::Instance(instance) => {
+                    std::iter::once(instance.klass)
+                        .chain(instance.fields.iter()
+                            .filter_map(|(k , v) | v.as_obj()))
+                        .collect()
+                }
             };
 
             for ref_to_mark in refs_to_mark {

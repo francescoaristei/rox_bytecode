@@ -327,7 +327,7 @@ impl<'a> Parser<'a> {
         rules_map.insert(TokenType::LeftBrace, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::RightBrace, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Comma, ParseRule::new(None, None, Precedence::PrecedenceNone));
-        rules_map.insert(TokenType::Dot, ParseRule::new(None, None, Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::Dot, ParseRule::new(None, Some(Parser::dot), Precedence::PrecedenceCall));
         rules_map.insert(TokenType::Minus, ParseRule::new(Some(Parser::unary), Some(Parser::binary), Precedence::PrecedenceTerm));
         rules_map.insert(TokenType::Plus, ParseRule::new(None, Some(Parser::binary), Precedence::PrecedenceTerm));
         rules_map.insert(TokenType::Semicolon, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -391,6 +391,8 @@ impl<'a> Parser<'a> {
     fn declaration(&mut self) {
         if self.match_token_type(TokenType::Var) {
             self.var_declaration();
+        } else if self.match_token_type(TokenType::Class) {
+            self.class_declaration();
         } else if self.match_token_type(TokenType::Fun) {
             self.fun_declaration();
         } else {
@@ -399,6 +401,34 @@ impl<'a> Parser<'a> {
         if self.panic_mode {
             self.synchronize();
         }
+    }
+
+    fn class_declaration(&mut self) {
+        self.consume(TokenType::Identifier, "Exepct class name.");
+        // the class name identifier is added to the surrounding function's constant table
+        // indeed printing a class means printing its name therefore the compilers needs to put this name
+        // somewhere for the runtime to find it
+        let name_constant = self.identifier_constant();
+
+        // the class name is also needed to associate the class to a variable of the same name
+        self.declare_variable();
+
+        // emit instruction to create the class object at runtime
+        self.emit_bytes(OpCode::OpClass.to_u8(), name_constant);
+
+        /*
+        *
+        * Above the class variable has been declared, however declaring a variable adds it to the scope
+        * but it needs to be defined to be used.
+        * For classes the variable is defined BEFORE the body of the class is compiled.
+        * In this way the user can refer to the containing class inside the bodies of its (the class)
+        * own method.
+        *
+         */
+        self.define_variable(name_constant);
+
+        self.consume(TokenType::LeftBrace, "Expect '{' before class body");
+        self.consume(TokenType::RightBrace, "Expect '}', after class body");
     }
 
     /*
@@ -1026,6 +1056,36 @@ impl<'a> Parser<'a> {
             .parse()
             .expect("Parsed value is not a double.");
         self.emit_constant(Value::Number(value));
+    }
+
+    fn dot(&mut self, can_assign: bool) {
+        self.consume(TokenType::Identifier, "Expect property name after '.'.");
+        // after the dot the parser expects a property name
+        // that token is load in the constant table as a string to make it available at runtime
+        let name = self.identifier_constant();
+
+        /*
+          *  In Pratt parsing, can_assign is true only when the current expression is being parsed at a precedence level at or below assignment (PREC_ASSIGNMENT)
+          *  Assignment is the lowest-precedence operation. If you're currently parsing at a higher precedence, you're inside a sub-expression where = cannot possibly be a valid assignment operator — it would violate the grammar.
+          *  So can_assign = false is just encoding that grammatical constraint.
+          *  It gets passed down through the parse rule calls.
+          *
+          *  For a + b.c = 3:
+          *
+          *  1. The parser starts parsing a + b.c = 3 at PREC_ASSIGNMENT level, so can_assign = true initially.
+          *  2. It parses a, then sees +. Since + has higher precedence than assignment, it recurses to parse the right-hand side at PREC_TERM or higher — meaning can_assign is now false for anything parsed on the right of +.
+          *  3. It parses b, then sees ., which triggers dot as an infix rule — with can_assign = false.
+          *  4. Inside dot, can_assign && self.match_token_type(Equal) is false, so it does not consume the = and emit OpSetProperty.
+          *  5. The = 3 is then left unconsumed, causing a compile error.
+          *
+          *  Without the can_assign guard, dot would see the =, consume it, emit OpSetProperty, and silently compile the invalid assignment as if it were valid.
+         */
+        if can_assign && self.match_token_type(TokenType::Equal) {
+            self.expression();
+            self.emit_bytes(OpCode::OpSetProperty.to_u8(), name);
+        } else {
+            self.emit_bytes(OpCode::OpGetProperty.to_u8(), name);
+        }
     }
 
     /*
