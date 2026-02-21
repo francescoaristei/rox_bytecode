@@ -1,7 +1,7 @@
 use crate::chunk::{Chunk, OpCode};
 use crate::compiler::Precedence::PrecedenceAssignment;
 use crate::heap::{Heap, HeapObj, ObjRef};
-use crate::object::FunctionType::TypeFunction;
+use crate::object::FunctionType::{TypeFunction, TypeInitializer, TypeMethod};
 use crate::object::{FunctionType, ObjFunction, CompilerUpvalue};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
@@ -118,6 +118,20 @@ impl<'a> Local<'a> {
         }
     }
 }
+
+/*
+* Tracks compile-time state for the class currently being compiled.
+* A new ClassCompiler is pushed onto Parser::class_compilers when entering a class body
+* and popped when leaving it. The vec therefore acts as a stack that mirrors the nesting
+* of class declarations in the source.
+*
+* Having at least one entry in the stack means the compiler is currently inside a class
+* body, which is used to validate that 'this' and (later) 'super' are only used where
+* they are legal.
+*
+* Will hold has_superclass: bool once inheritance is implemented (Chapter 29).
+*/
+struct ClassCompiler {}
 
 struct Compiler<'a> {
     /*
@@ -316,7 +330,10 @@ pub struct Parser<'a> {
     compiler: Box<Compiler<'a>>,
     heap: &'a mut Heap,
     had_error: bool,
-    panic_mode: bool
+    panic_mode: bool,
+    // Stack of ClassCompilers, one per currently-open class body. Non-empty iff the
+    // compiler is currently inside a class declaration.
+    class_compilers: Vec<ClassCompiler>
 }
 
 impl<'a> Parser<'a> {
@@ -356,7 +373,7 @@ impl<'a> Parser<'a> {
         rules_map.insert(TokenType::Print, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Return, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Super, ParseRule::new(None, None, Precedence::PrecedenceNone));
-        rules_map.insert(TokenType::This, ParseRule::new(None, None, Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::This, ParseRule::new(Some(Parser::this), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::True, ParseRule::new(Some(Parser::literal), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Var, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::While, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -371,7 +388,8 @@ impl<'a> Parser<'a> {
             compiler: Box::new(Compiler::new()),
             heap,
             had_error: false,
-            panic_mode: false
+            panic_mode: false,
+            class_compilers: Vec::new()
         }
     }
     
@@ -404,7 +422,10 @@ impl<'a> Parser<'a> {
     }
 
     fn class_declaration(&mut self) {
-        self.consume(TokenType::Identifier, "Exepct class name.");
+        // Push a ClassCompiler so that 'this' (and later 'super') know they are inside
+        // a valid class body for the duration of compiling this class's methods.
+        self.class_compilers.push(ClassCompiler {});
+        self.consume(TokenType::Identifier, "Expect class name.");
         // the class name identifier is added to the surrounding function's constant table
         // indeed printing a class means printing its name therefore the compilers needs to put this name
         // somewhere for the runtime to find it
@@ -427,8 +448,73 @@ impl<'a> Parser<'a> {
          */
         self.define_variable(name_constant);
 
+        // necessary to put the name of the class at the top of the stack before
+        // starting the method declaration, otherwise the methods are not able to locate the class
+        // when binding to it: it could be on the stack somewhere as local variable or on the globals
+        // in case is a top-level declaration class.
+        // basically while compiling the methods, these will be on the top of the stack right on top of the
+        // class name
+        self.named_variable(false);
+
         self.consume(TokenType::LeftBrace, "Expect '{' before class body");
+
+        /*
+        * A class could contain an arbitrarily big number of methods.
+        * If the compiler emitted 1 single OP_CLASS instruction with all
+        * the bytecode for the methods the runtime would have a lot of work to do
+        * for class declaration.
+        * Instead, the OP_CLASS instruction declares an empty class.
+        * Then for each method, an OP_METHOD instruction is emitted, which populates
+        * that class with a new method.
+        * The result is a full complete class with all its methods.
+         */
+        while !self.check(TokenType::RightBrace) && !self.check(TokenType::Eof) {
+            self.method();
+        }
+
         self.consume(TokenType::RightBrace, "Expect '}', after class body");
+
+        // Class body is fully compiled; restore the enclosing class context (or none).
+        self.class_compilers.pop();
+
+        // The name of the class is no longer needed on the stack and can be popped
+        self.emit_byte(OpCode::OpPop.to_u8());
+    }
+
+
+    /*
+    * A new method definition requires three things:
+    *   - Name of the method
+    *   - Closure for the method body
+    *   - Class to bind the method to
+    *
+     */
+    fn method(&mut self) {
+        self.consume(TokenType::Identifier, "Expect method name.");
+        // the compiler adds the method name to the constant table and get back the index in the table
+        // then it emits the OP_METHOD instruction passing as byte argument the index of the method name in the constant
+        // table
+        let constant = self.identifier_constant();
+
+        /*
+        * function(): helper wrote for compiling function declarations.
+        * That utility function compiles the subsequent parameter list and function body.
+        * Then it emits the code to create an ObjClosure and leave it on top of the stack.
+        * At runtime, the VM will find the closure there
+         */
+        let mut function_type = TypeMethod;
+
+        /*
+        * We want to make sure that when the user defines the init() initializer method,
+        * this method returns automatically "this" (the instance) without the need of the user to
+        * remember to define "return this" therefore we need to modify the logic that normally returns
+        * the default "nil" to return "this" in this case.
+         */
+        if self.previous.get_lexeme() == "init" {
+            function_type = TypeInitializer;
+        }
+        self.function(function_type);
+        self.emit_bytes(OpCode::OpMethod.to_u8(), constant);
     }
 
     /*
@@ -492,6 +578,11 @@ impl<'a> Parser<'a> {
         if self.match_token_type(TokenType::Semicolon) {
             self.emit_return();
         } else {
+            if self.compiler.type_fn == FunctionType::TypeInitializer {
+                self.error("Can't return a value from an initializer.");
+                // we still continue compiling to avoid the compiler to get confused
+                // by the trailing expression starting giving unrelated errors.
+            }
             self.expression();
             self.consume(TokenType::Semicolon, "Expect ';' after return.");
             self.emit_byte(OpCode::OpReturn.to_u8());
@@ -690,6 +781,40 @@ impl<'a> Parser<'a> {
          */
         let mut compiler = Compiler::new();
         compiler.type_fn = function_type;
+        /*
+        * "this" is treated as a local variable.
+        * Closures inside a method that references this will capture the receiver in an upvalue.
+        * in the this() function self.variable(false) is used.
+        * self.variable(boolean) compiles identifier expressions as variable accesses.
+        * The boolean parameter is needed to tell the function if it should look for a following '='
+        * and parse a setter, we don't want that with "this".
+        * self.variable does not care that "this" is a special reserved word and treats it like a normal
+        * variable which should be looked up using the usual scope resolution mechanism.
+        * Until captured by closures, every local variable is stored on the VM stack.
+        * We reserved the slot zero in the function stack window with an empty local variable.
+        * For function calls that slots end up holding the function being called, but since the name is
+        * empty, the function body never access that local variable.
+        * For methods, we will use that slot to store the receiver, e.g the instance that is pointed by "this"
+        *
+        *
+        * To understand why it works:
+        * The key is understanding what slot 0 actually contains at runtime when a method is called.
+        *
+        * When the VM calls a method, it sets up the CallFrame such that frame.slots points to the position on the stack where the receiver (the instance) sits.
+        * That is slot 0 of the call frame. This is the same convention used for
+        * regular functions, where slot 0 holds the closure itself — for methods, slot 0 holds the instance instead.
+        *
+        * So at runtime, the instance is physically sitting at slot 0 of the method's call frame.
+        *
+        * At compile time, when the compiler sees this inside a method body, it calls resolve_local("this").
+        * It walks compiler.locals looking for a local whose name matches "this". It finds it at index 0. So it emits OpGetLocal 0.
+        *
+        *
+        * At runtime, OpGetLocal 0 reads stack[frame.slots + 0] — which is exactly the receiver that the VM placed there when it set up the call frame.
+         */
+        if function_type != TypeFunction && function_type != FunctionType::TypeScript {
+            compiler.locals[0].name = Token::new("this");
+        }
         let enclosing_compiler = replace(self.compiler.as_mut(), compiler);
         self.compiler.enclosing = Some(Box::new(RefCell::new(enclosing_compiler)));
         if function_type != FunctionType::TypeScript {
@@ -1083,9 +1208,49 @@ impl<'a> Parser<'a> {
         if can_assign && self.match_token_type(TokenType::Equal) {
             self.expression();
             self.emit_bytes(OpCode::OpSetProperty.to_u8(), name);
+
+        } else if self.match_token_type(TokenType::LeftParen) {
+            /*
+            *  When a method like obj.method(arg) is called, the VM does two separate operations:
+            * 1. OpGetProperty — looks up method on obj, creates an ObjBoundMethod pairing the closure with the receiver, pops the instance, and pushes the bound method onto the stack.
+            * 2. OpCall — pops the bound method, sets up a CallFrame, and calls the closure.
+            *
+            * The ObjBoundMethod is heap-allocated just to be immediately consumed and discarded by OpCall. It exists for only one instruction's lifetime. This means:
+            * - A heap allocation is made and then thrown away
+            * - The GC has to track this short-lived object
+            * - Two dispatch iterations through the VM loop instead of one
+            *
+            * OpInvoke fuses these two steps into a single instruction that takes both the method name and the argument count as operands.
+            * At runtime it looks up the method on the instance's class and calls the closure directly, skipping the ObjBoundMethod allocation entirely.
+            * The optimization is only valid when the compiler sees the pattern expr.name(args) as a single syntactic unit —
+            * If the method is accessed without an immediate call (e.g. var f = obj.method), OpGetProperty is still used as before since a bound method is needed in that case.
+            *
+             */
+            let arg_count = self.argument_list();
+            self.emit_bytes(OpCode::OpInvoke.to_u8(), name); // name is the index in the constant table
+            self.emit_byte(arg_count);
+
         } else {
             self.emit_bytes(OpCode::OpGetProperty.to_u8(), name);
         }
+    }
+
+    /*
+    * 'this' is syntactic sugar for the receiver local at slot 0 of the current method's
+    * call frame. The compiler resolves it exactly like any other local variable whose
+    * name happens to be "this" (placed in locals[0] by function() for TypeMethod and
+    * TypeInitializer).
+    *
+    * Guarded by class_compilers: if we are not inside a class body there is no slot 0
+    * receiver and 'this' is illegal. Without this guard 'this' would fall through to a
+    * global lookup and produce a confusing runtime error instead of a clear compile error.
+    */
+    fn this(&mut self, can_assign: bool) {
+        if self.class_compilers.is_empty() {
+            self.error("Can't use 'this' outside of a class.");
+            return;
+        }
+        self.variable(false);
     }
 
     /*
@@ -1497,7 +1662,12 @@ impl<'a> Parser<'a> {
     }
 
     fn emit_return(&mut self) {
-        self.emit_byte(OpCode::OpNil.to_u8());
+        if self.compiler.type_fn == FunctionType::TypeInitializer {
+            self.emit_bytes(OpCode::OpGetLocal.to_u8(), 0);
+        } else {
+            self.emit_byte(OpCode::OpNil.to_u8());
+
+        }
         self.emit_byte(OpCode::OpReturn.to_u8());
     }
 

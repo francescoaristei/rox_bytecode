@@ -10,7 +10,9 @@ pub struct ObjString {
 #[derive(Clone, Copy, PartialEq)]
 pub enum FunctionType {
     TypeFunction,
-    TypeScript
+    TypeScript,
+    TypeMethod,
+    TypeInitializer
 }
 
 /*
@@ -182,13 +184,16 @@ impl ObjUpvalue {
 
 
 pub struct ObjClass {
-    pub name: Option<ObjRef>
+    pub name: Option<ObjRef>,
+    // key name of the method, value method
+    pub methods: HashMap<ObjRef, Value> // even though the Value is always a Closures but simplify retrieval
 }
 
 impl ObjClass {
     pub fn new(name: ObjRef) -> Self {
         ObjClass {
-            name: Some(name)
+            name: Some(name),
+            methods: HashMap::new()
         }
     }
 }
@@ -204,6 +209,54 @@ impl ObjInstance {
         ObjInstance {
             klass,
             fields: HashMap::new()
+        }
+    }
+}
+
+
+/*
+* When a method is accessed in Lox, "this" gets bounded to the instance from where that
+* method is called.
+* Take this example:
+*
+*    class Person {
+*      sayName() {
+*        print this.name;
+*      }
+*    }
+*
+*    var jane = Person();
+*    jane.name = "Jane";
+*
+*    var method = jane.sayName;
+*    method(); // ?
+*
+* It should print "Jane", the object returned by .sayName needs to remember
+* the instance it was accessed from.
+* The tree-walk interpreter solved this using the heap-allocated Environment class which managed variable storage.
+* THe bytecode compiler however, manages state in a more complext way:
+*   - local variables on the stack
+*   - global variables on the global table
+*   - variables closed-over are upvalues.
+*
+* A new runtime is required.
+* When the user executes a method access, the closure for that method is found and "bounded" to this
+* struct which tracks the instance from which the method was called.
+* This bound method object can be later called like a function.
+* The VM will be able to connect the "this" to the receiver inside the method's body.
+*
+ */
+
+pub struct ObjBoundMethod {
+    pub receiver: ObjRef, // the specific instance (what "this" will be)
+    pub method: ObjRef // the closure
+}
+
+impl ObjBoundMethod {
+    pub fn new(receiver: ObjRef, method: ObjRef) -> Self {
+        ObjBoundMethod {
+            receiver,
+            method
         }
     }
 }

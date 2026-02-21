@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::object::{ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjNativeFunction, ObjString, ObjUpvalue};
+use crate::object::{ObjBoundMethod, ObjClass, ObjClosure, ObjFunction, ObjInstance, ObjNativeFunction, ObjString, ObjUpvalue};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ObjRef(usize);
@@ -12,7 +12,8 @@ pub enum HeapObj {
     Closure(ObjClosure),
     Upvalue(ObjUpvalue),
     Class(ObjClass),
-    Instance(ObjInstance)
+    Instance(ObjInstance),
+    BoundMethod(ObjBoundMethod)
 }
 
 impl HeapObj {
@@ -24,7 +25,8 @@ impl HeapObj {
             HeapObj::Closure(_) => "Closure",
             HeapObj::Upvalue(_) => "Upvalue",
             HeapObj::Class(_) => "Class",
-            HeapObj::Instance(_) => "Instance"
+            HeapObj::Instance(_) => "Instance",
+            HeapObj::BoundMethod(_) => "BoundMethod"
         }
     }
 
@@ -116,6 +118,20 @@ impl HeapObj {
         match self {
             HeapObj::Instance(v) => Some(v),
             _ => None
+        }
+    }
+
+    pub fn as_bound_method(&self) -> &ObjBoundMethod {
+        match self {
+            HeapObj::BoundMethod(v) => v,
+            _ => panic!("Expected BoundMethod")
+        }
+    }
+
+    pub fn as_mut_bound_method(&mut self) -> &mut ObjBoundMethod {
+        match self {
+            HeapObj::BoundMethod(v) => v,
+            _ => panic!("Expected BoundMethod")
         }
     }
 }
@@ -300,13 +316,24 @@ impl Heap {
                         .collect()
                 },
                 HeapObj::Class(class) => {
-                    class.name.into_iter().collect()
+                    class.name.into_iter()
+                        .chain(class.methods.keys().copied())
+                        .chain(class.methods.values().filter_map(|v| v.as_obj()))
+                        .collect()
                 },
                 HeapObj::Instance(instance) => {
                     std::iter::once(instance.klass)
-                        .chain(instance.fields.iter()
-                            .filter_map(|(k , v) | v.as_obj()))
+                        .chain(instance.fields.keys().copied())
+                        .chain(instance.fields.values().filter_map(|v| v.as_obj()))
                         .collect()
+                },
+                HeapObj::BoundMethod(bound_method) => {
+                    /*
+                    * A handle to a method keeps the receiver around in memory
+                    * so that when "this" uses the handle (invokes the method), is still able to find
+                    * the receiver.
+                     */
+                    vec![bound_method.method, bound_method.receiver]
                 }
             };
 

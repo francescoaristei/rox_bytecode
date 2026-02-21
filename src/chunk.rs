@@ -43,7 +43,9 @@ pub enum OpCode {
     OpCloseUpValue = 28,
     OpClass = 29,
     OpSetProperty = 30,
-    OpGetProperty = 31
+    OpGetProperty = 31,
+    OpMethod = 32,
+    OpInvoke = 33
 }
 
 impl OpCode {
@@ -81,6 +83,8 @@ impl OpCode {
             29 => Some(OpCode::OpClass),
             30 => Some(OpCode::OpSetProperty),
             31 => Some(OpCode::OpGetProperty),
+            32 => Some(OpCode::OpMethod),
+            33 => Some(OpCode::OpInvoke),
             _ => None
         }
     }

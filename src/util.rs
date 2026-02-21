@@ -102,6 +102,8 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &mut usize, heap: &Heap) -
         Some(OpCode::OpClass) => constant_instruction("OP_CLASS", chunk, offset, heap),
         Some(OpCode::OpGetProperty) => constant_instruction("OP_GET_PROPERTY", chunk, offset, heap),
         Some(OpCode::OpSetProperty) => constant_instruction("OP_SET_PROPERTY", chunk, offset, heap),
+        Some(OpCode::OpMethod) => constant_instruction("OP_METHOD", chunk, offset, heap),
+        Some(OpCode::OpInvoke) => invoke_instruction("OP_INVOKE", chunk, offset, heap),
         None => {
             println!("Unknown opcode: {}", byte);
             *offset + 1
@@ -132,6 +134,15 @@ fn constant_instruction(name: &str, chunk: &Chunk, offset: &usize, heap: &Heap) 
     chunk.get_constants().get_value(constant_index).print_value(heap);
     print!("\n");
     *offset + 2
+}
+
+fn invoke_instruction(name: &str, chunk: &Chunk, offset: &usize, heap: &Heap) -> usize {
+    let constant_index = chunk.get_code()[*offset + 1] as usize;
+    let arg_count = chunk.get_code()[*offset + 2];
+    print!("    {:16} ({} args) {:4}  ", name, arg_count, constant_index);
+    chunk.get_constants().get_value(constant_index).print_value(heap);
+    print!("\n");
+    *offset + 3
 }
 
 fn simple_instruction(name: &str, offset: &usize) -> usize {

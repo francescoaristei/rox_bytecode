@@ -34,7 +34,11 @@ impl Value {
                     HeapObj::Closure(closure) => { self.display_closure(&closure.obj_function, heap) },
                     HeapObj::Upvalue(_) => print!("upvalue"),
                     HeapObj::Class(class) => { self.display_class(class.name, heap) },
-                    HeapObj::Instance(instance) => { self.display_instance(instance.klass, heap) }
+                    HeapObj::Instance(instance) => { self.display_instance(instance.klass, heap) },
+                    HeapObj::BoundMethod(bound_method) => {
+                        let closure = heap.get(bound_method.method).as_closure();
+                        self.display_function(Option::from(closure.obj_function), heap);
+                    }
                 }
             },
             Value::Nil => print!("nil")

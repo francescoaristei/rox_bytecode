@@ -2,13 +2,11 @@ use crate::chunk::{Chunk, OpCode};
 use crate::compiler::Parser;
 use crate::heap::HeapObj;
 use crate::heap::{Heap, ObjRef};
+use crate::object::{NativeFn, ObjBoundMethod, ObjClass, ObjClosure, ObjInstance, ObjNativeFunction, ObjUpvalue};
 use crate::value::Value;
 use crate::value::Value::Obj;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::fmt::format;
-use crate::chunk::OpCode::OpClass;
-use crate::object::{NativeFn, ObjClass, ObjClosure, ObjInstance, ObjNativeFunction, ObjUpvalue};
 use crate::vm::Error::InterpretRuntimeError;
 /*
 * Frame/Base Pointer:
@@ -122,7 +120,8 @@ pub struct Vm {
     stack: Vec<Value>,
     globals: HashMap<ObjRef, Value>,
     heap: Heap,
-    upvalues: Option<ObjRef>
+    upvalues: Option<ObjRef>,
+    init_string: Option<ObjRef>
 }
 
 pub enum Error {
@@ -146,7 +145,8 @@ impl Vm {
             stack: Vec::new(),
             globals: HashMap::new(),
             heap: Heap::new(),
-            upvalues: None
+            upvalues: None,
+            init_string: None
         }
     }
 
@@ -165,6 +165,7 @@ impl Vm {
         if function.is_none() {
             return Err(Error::InterpretCompilerError);
         }
+        self.init_string = Some(self.intern_string("init".to_string()));
         /*
          * Compiler roots problem.
          *
@@ -236,6 +237,19 @@ impl Vm {
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
             let instruction: u8 = self.read_byte();
             match OpCode::from_u8(instruction) {
+                Some(OpCode::OpInvoke) => {
+                    let method = self.read_constant().as_obj().expect("Expected method");
+                    let arg_count = self.read_byte();
+                    if !self.invoke(method, arg_count) {
+                        return Err(InterpretRuntimeError);
+                    }
+                    //let last = self.frames.len() - 1;
+                    //let frame = &self.frames[last];
+                },
+                Some(OpCode::OpMethod) => {
+                    let method_name_ref = self.read_constant().as_obj().unwrap();
+                    self.define_method(method_name_ref);
+                },
                 Some(OpCode::OpGetProperty) => {
                     // at this point of the interpreter flow, the expression on the left of the dot has alrready been
                     // consumed and the instance is on the top of the stack
@@ -250,7 +264,6 @@ impl Vm {
 
                     // the field name is read from the constant pool
                     let property_name_ref = self.read_constant().as_obj().unwrap();
-                    let property_name = self.heap.get(property_name_ref).as_string();
 
                     if let Some(value) = instance_obj.fields.get(&property_name_ref) {
                         let value = *value;
@@ -258,7 +271,14 @@ impl Vm {
                         self.stack.pop();
                         self.stack.push(value);
                     } else {
-                        return Err(self.runtime_error(&format!("Undefined property: {}", property_name.chars)));
+                        // if the property is not a field of the instance (which has priority of methods)
+                        // it could be a method of
+                        // the instance and we check for it, if is not then the propery is undefined.
+                        let klass = instance_obj.klass;
+                        if !self.bind_method(klass, property_name_ref) {
+                            let property_name = self.heap.get(property_name_ref).as_string();
+                            return Err(self.runtime_error(&format!("Undefined property: {}", property_name.chars)));
+                        }
                     }
                 },
                 Some(OpCode::OpSetProperty) => {
@@ -712,6 +732,114 @@ impl Vm {
     }
 
     /*
+    * If it finds a method it places the method on the stack and returns true
+    * otherwise it returns false.
+    * Method binding process:
+    *
+    * brunch          --> ObjInstance { klass, fields }
+    *
+    * bindMethod()
+    *
+    * eggs            --> ObjBoundMethod { receiver, method }
+    *                          receiver --> ObjInstance
+    *                          method   --> ObjClosure { function, upvalues, upvalueCount }
+    *
+    * ObjInstance.klass  --> ObjClass { name, methods }
+    *                          methods: "eggs" --> ObjClosure
+     */
+    fn bind_method(&mut self, klass_ref: ObjRef, name_ref: ObjRef) -> bool {
+        let klass = self.heap.get_mut(klass_ref).as_mut_class();
+        if !klass.methods.contains_key(&name_ref) {
+            let name = &self.heap.get(name_ref).as_string().chars;
+            self.runtime_error(&format!("Undefined property {}", name));
+            false
+        } else {
+            let method = klass.methods[&name_ref].as_obj().expect("Expected method.");
+            let receiver = self.peek(0).as_obj().expect("Expected receiver.");
+            let bound = ObjBoundMethod::new(receiver, method);
+            let bound_ref = self.heap.alloc(HeapObj::BoundMethod(bound));
+            // the receiver is popped and replace with the bound method
+            self.stack.pop();
+            self.stack.push(Obj(bound_ref));
+            true
+        }
+    }
+
+    fn define_method(&mut self, method_name_ref: ObjRef) {
+        // let method_name = self.heap.get(method_name_ref).as_string();
+        /*
+        * The closure is on the top of the stack, and just below the class.
+        * Both are peeked and the closure is stored in the klass methods table
+        * Then the closure is popped from the stack as it is not used anymore.
+         */
+        let method = *self.peek(0);
+        // peek(1) is a compiler invariant: OpMethod is only ever emitted inside the class body where the compiler
+        // guarantees that the class is on the stack below the closure.
+        let klass = self.heap.get_mut(self.peek(1).as_obj().expect("Expected class below method closure")).as_mut_class();
+        klass.methods.insert(method_name_ref, method);
+        self.stack.pop();
+    }
+
+    fn invoke(&mut self, method_ref: ObjRef, arg_count: u8) -> bool {
+        let receiver_ref = self.peek(arg_count as usize).as_obj().expect("Expect ObjRef");
+        if let Some(instance) = self.heap.get(receiver_ref).try_as_instance() {
+            /*
+            * This is a fix to a bug that the optimization introduces
+            * Taken this program:
+            * class Oops {
+            *   init() {
+            *        fun f() {
+            *            print "not a method";
+            *        }
+            *
+            *        this.field = f;
+            *    }
+            *  }
+            *
+            * var oops = Oops();
+            * oops.field();
+            *
+            *
+            * Before this fix, the compiler would think that oops.field() is a method call
+            * emitting a OP_INVOKE, however what is actually is, is a field access which happe
+            * to be a function which is then invoked, the VM before the fix crashes with runtime error
+            * because is not able to find a method named "field"
+            * The fix is: if we find a field with the same name of the method passed as parameter
+            * this field is stored on the stack in the place of the receiver.
+            * Then we try to call the field value as a callable (as we expect it to be).
+            * If is not a callable returning an error is this time correct.
+            *
+             */
+            if let Some(field) = instance.fields.get(&method_ref) {
+                let index = self.stack.len() - (arg_count + 1) as usize;
+                self.stack[index] = *field;
+                return self.call_value(*field, arg_count);
+            }
+            return self.invoke_from_class(instance.klass, method_ref, arg_count);
+        }
+        self.runtime_error("Only instances have methods");
+        false
+    }
+
+
+    /*
+    * It combines the logic of OP_GET_PROPERTY and OP_CALL
+    * First the method name is retrieved from the constant table.
+    * Then the closure for that method is taken and a call to it into the CallFrame
+    * stack is pushed.
+    *
+     */
+    fn invoke_from_class(&mut self, klass: ObjRef, method_ref: ObjRef, arg_count: u8) -> bool {
+        let klass = self.heap.get(klass).as_class();
+        let method_name = &self.heap.get(method_ref).as_string().chars;
+        if let Some(method) = klass.methods[&method_ref].as_obj() {
+            return self.call(method, arg_count);
+        }
+        self.runtime_error(&format!("Undefined property: {}", method_name));
+        false
+    }
+
+    /*
     * The linked list of upvalues is created in such a way to be sorted
     * by descending slot index.
     * Where the slot is the slot of the closed over variable on the stack
@@ -810,18 +938,80 @@ impl Vm {
         match value {
             Obj(obj_ref) => {
                 match self.heap.get(obj_ref) {
-                    //HeapObj::Function(_) => self.call(obj_ref, arg_count),
-                    HeapObj::Class(obj_class) => {
+                    HeapObj::BoundMethod(bound_method) => {
+                        // in this way the receiver is put in slot 0 of the local window of the call frame
+                        // in fact on the top of the stack before slot 0 there are all the arguments
+                        let slot0 = self.stack.len() - 1 - arg_count as usize;
+                        self.stack[slot0] = Obj(bound_method.receiver);
+                        // use call to invoke the method in the bound method
+                        self.call(bound_method.method, arg_count)
+                    },
+                    HeapObj::Class(klass) => {
                       /*
                       * If the value being called (the thing on the left of the parentheses)
                       * is a class, then the calls is considered as a constructor call,
                       * a new instance of that class is created and stored onto the stack
                       *
                        */
+                        let init_ref = self.init_string
+                            .and_then(|s| klass.methods.get(&s))
+                            .map(|v| v.as_obj().expect("Expect closure"));
+
                         let obj_instance = ObjInstance::new(obj_ref);
                         let instance_ref = self.heap.alloc(HeapObj::Instance(obj_instance));
                         let top_stack = self.stack.len() - 1 - arg_count as usize;
                         self.stack[top_stack] = Obj(instance_ref);
+
+                        /*
+                        * In Lox initializers (constructors) follow these rules:
+                        *   - The runtime automatically invokes the initializer method whenever an instance of a class is created.
+                        *   - The caller that constructs an instance always gets the instance back after the initializer finishes,
+                        *     regardless of what the initializer function itself returns.
+                        *   - The initializer method doesn’t need to explicitly return this. In fact, an initializer
+                        *     is prohibited from returning any value at all since the value would never be seen anyway.
+                        *
+                        * Here what happens is that after the runtime allocates a new instance, it looks for an init() method on the class.
+                        * If it finds one it is called, pushing a new CallFrame for the initializer closure.
+                        *
+                        * How come that the arguments passed to the class call are automatically accessible to the CallFrame defined when calling init() ?
+                        * The arguments are automatically forwarded to init() without any explicit copying.
+                        * This works because of how CallFrame windows overlap on the stack.
+                        *
+                        * A CallFrame is NOT a separate region of memory — it is just a struct holding a ‘slots’
+                        * index into the existing stack. The values on the stack never move.
+                        *
+                        * When Point(1, 2) is called, OpCall creates a CallFrame with slots = N (index of Point on the stack):
+                        *
+                        *   stack:  [ ... | Point class | 1 | 2 ]
+                        *                   ^ index N
+                        *   CallFrame for Point { slots: N }
+                        *
+                        * The class at index N is then replaced with the new instance:
+                        *
+                        *   stack:  [ ... | instance | 1 | 2 ]
+                        *                   ^ index N
+                        *
+                        * self.call(initializer, arg_count) creates a second CallFrame for init().
+                        * It computes slots as stack.len() - arg_count - 1, which is again index N — the same position:
+                        *
+                        *   stack:  [ ... | instance | 1 | 2 ]
+                        *                   ^ index N   ^ N+1    ^ N+2
+                        *                   (this)      (first param of init)
+                        *   CallFrame for init { slots: N }   <-- points to the same index N
+                        *
+                        * The first CallFrame (for the class call) is immediately superseded by the second (for init).
+                        * Nothing is pushed, popped, or copied: the two CallFrames simply describe the same region of the stack.
+                        *
+                         */
+                        if let Some(init_closure_ref) = init_ref {
+                            return self.call(init_closure_ref, arg_count);
+                        } else if arg_count != 0 {
+                            // if an initializer has not been defined, it does not make sense to define an instance passing
+                            // arguments
+                            self.runtime_error(&format!("Expected 0 arguments but got {}", arg_count));
+                            return false;
+                        }
+
                         true
                     },
                     HeapObj::Closure(_) => { self.call(obj_ref, arg_count) },
@@ -1102,7 +1292,9 @@ impl Vm {
             let upvalue_obj = self.heap.get(upvalue_ref).as_upvalue();
             upvalue = upvalue_obj.next;
         }
-
+        if let Some(init_ref) = self.init_string {
+            self.heap.mark_object(init_ref);
+        }
         self.mark_globals();
     }
 
