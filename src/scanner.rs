@@ -262,7 +262,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn peek_next(&self) -> u8 {
-        if self.is_at_end() {
+        if self.current + 1 >= self.source.len() {
             return b'\0';
         }
         self.source.as_bytes()[self.current + 1]

@@ -6,6 +6,7 @@ use crate::object::{FunctionType, ObjFunction, CompilerUpvalue};
 use crate::scanner::{Scanner, Token, TokenType};
 use crate::value::Value;
 use crate::value::Value::Obj;
+use crate::util::disassemble_chunk;
 use std::collections::HashMap;
 use std::cell::RefCell;
 use std::mem::replace;
@@ -526,18 +527,25 @@ impl<'a> Parser<'a> {
 
         self.consume(TokenType::RightBrace, "Expect '}', after class body");
 
-        // Close the 'super' scope if one was opened, emitting OpCloseUpvalue so that
-        // any method closure that captured 'super' as an upvalue keeps a valid reference
-        // to the superclass after the stack slot is gone.
-        if self.class_compilers.last().map(|cc| cc.has_superclass).unwrap_or(false) {
-            self.end_scope();
-        }
+        // Read has_superclass before popping the class compiler.
+        let has_superclass = self.class_compilers.last().map(|cc| cc.has_superclass).unwrap_or(false);
 
         // Class body is fully compiled; restore the enclosing class context (or none).
         self.class_compilers.pop();
 
-        // The name of the class is no longer needed on the stack and can be popped
+        // The name of the class is no longer needed on the stack and can be popped.
+        // This must happen BEFORE end_scope() so that when OpCloseUpvalue runs for 'super',
+        // 'super' is at the top of the stack and close_upvalues() correctly closes it.
+        // If end_scope() ran first, the class would still be above 'super' on the stack and
+        // close_upvalues(stack.len()-1) would point to the class slot, leaving 'super' unclosed.
         self.emit_byte(OpCode::OpPop.to_u8());
+
+        // Close the 'super' scope if one was opened, emitting OpCloseUpvalue so that
+        // any method closure that captured 'super' as an upvalue keeps a valid reference
+        // to the superclass after the stack slot is gone.
+        if has_superclass {
+            self.end_scope();
+        }
     }
 
 
@@ -1066,8 +1074,9 @@ impl<'a> Parser<'a> {
                  */
                 if arg_count == 255 {
                     self.error("Cannot have more than 255 arguments.");
+                } else {
+                    arg_count += 1;
                 }
-                arg_count += 1;
                 if !self.match_token_type(TokenType::Comma) {
                     break;
                 }
@@ -1202,7 +1211,11 @@ impl<'a> Parser<'a> {
                 get_op = OpCode::OpGetUpValue.to_u8();
                 set_op = OpCode::OpSetUpValue.to_u8();
             } else {
-                arg = Some(self.identifier_constant());
+                // Use the `name` parameter directly rather than self.previous.get_lexeme(),
+                // because named_variable is sometimes called with a synthetic name ("this",
+                // "super", the class name) that doesn't match the currently-parsed token.
+                let interned = self.intern_string(name);
+                arg = Some(self.make_constant(Value::Obj(interned)));
                 get_op = OpCode::OpGetGlobal.to_u8();
                 set_op = OpCode::OpSetGlobal.to_u8();
             }
@@ -1748,12 +1761,14 @@ impl<'a> Parser<'a> {
     fn end_compiler(&mut self) -> ObjFunction {
         #[cfg(feature = "debug-trace-execution")]
         {
-            let function_name = match self.compiler.function.as_ref().and_then(|f| f.name) {
-                Some(name) => &self.heap.get(name).as_string().chars,
-                None => "script"
-            };
             if !self.had_error {
-                disassemble_chunk(self.current_chunk(), function_name, &self.heap);
+                let function = self.compiler.function.as_ref().unwrap();
+                let chunk = &function.chunk;
+                let function_name = match function.name {
+                    Some(name) => self.heap.get(name).as_string().chars.as_str(),
+                    None => "script"
+                };
+                disassemble_chunk(chunk, function_name, &self.heap);
             }
         }
         self.emit_return();
@@ -1866,7 +1881,7 @@ impl<'a> Parser<'a> {
         match token.get_token_type() {
             TokenType::Eof => eprint!(" at end"),
             TokenType::Error => (),
-            _ => eprint!("at {}", token.get_lexeme())
+            _ => eprint!(" at '{}'", token.get_lexeme())
         }
         eprint!(": {}", message);
         self.had_error = true;

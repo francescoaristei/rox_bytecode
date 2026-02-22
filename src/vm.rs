@@ -5,6 +5,7 @@ use crate::heap::{Heap, ObjRef};
 use crate::object::{NativeFn, ObjBoundMethod, ObjClass, ObjClosure, ObjInstance, ObjNativeFunction, ObjUpvalue};
 use crate::value::Value;
 use crate::value::Value::Obj;
+use crate::util::disassemble_instruction;
 use std::cell::Cell;
 use std::collections::HashMap;
 use crate::vm::Error::InterpretRuntimeError;
@@ -228,16 +229,16 @@ impl Vm {
             #[cfg(feature = "debug-trace-execution")]
             {
                 // use: cargo run --features debug-trace-execution
-                print!("        ");
+                print!("[");
                 for value in &self.stack {
-                    print("[");
+                    print!("[");
                     value.print_value(&self.heap);
                     print!("]");
                 }
                 print!("\n");
                 let chunk = self.get_current_chunk();
-                let ip = self.current_frame().ip.get();
-                disassemble_instruction(chunk, &ip, &self.heap);
+                let mut ip = self.current_frame().ip.get();
+                disassemble_instruction(chunk, &mut ip, &self.heap);
             }
 
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
@@ -253,11 +254,10 @@ impl Vm {
                     * therefore if a method named 'x' is also defined in the subclass, it will substitute in the hashmap
                     * method x of the superclass.
                      */
-                    let superclass_ref = self.peek(1).as_obj().expect("Expect superclass ref");
-                    if !self.heap.get(superclass_ref).is_class() {
-                        self.runtime_error("Superclass must be a class");
-                        return Err(InterpretRuntimeError);
-                    }
+                    let superclass_ref = match self.peek(1).as_obj() {
+                        Some(r) if self.heap.get(r).is_class() => r,
+                        _ => return Err(self.runtime_error("Superclass must be a class.")),
+                    };
                     let subclass_ref = self.peek(0).as_obj().expect("Expect subclass ref");
                     let superclass_methods = self.heap.get(superclass_ref).as_class().methods.clone(); // cloning of obj_refs
                     let subclass = self.heap.get_mut(subclass_ref).as_mut_class();
@@ -321,7 +321,10 @@ impl Vm {
                 Some(OpCode::OpGetProperty) => {
                     // at this point of the interpreter flow, the expression on the left of the dot has alrready been
                     // consumed and the instance is on the top of the stack
-                    let instance_ref = self.peek(0).as_obj().expect("Expect instance");
+                    let instance_ref = match self.peek(0).as_obj() {
+                        Some(r) => r,
+                        None => return Err(self.runtime_error("Only instances have properties.")),
+                    };
 
                     let instance_obj = match self.heap.get(instance_ref).try_as_instance() {
                         Some(v) => v,
@@ -360,7 +363,10 @@ impl Vm {
                     * the assigned value.
                     *
                      */
-                    let instance_ref = self.peek(1).as_obj().expect("Expect instance");
+                    let instance_ref = match self.peek(1).as_obj() {
+                        Some(r) => r,
+                        None => return Err(self.runtime_error("Only instances have fields.")),
+                    };
 
                     let property_name_ref = self.read_constant().as_obj().unwrap();
 
@@ -899,8 +905,9 @@ impl Vm {
      */
     fn invoke_from_class(&mut self, klass: ObjRef, method_ref: ObjRef, arg_count: u8) -> bool {
         let klass = self.heap.get(klass).as_class();
-        let method_name = &self.heap.get(method_ref).as_string().chars;
-        if let Some(method) = klass.methods[&method_ref].as_obj() {
+        let method_name = self.heap.get(method_ref).as_string().chars.clone();
+        if let Some(method_value) = klass.methods.get(&method_ref) {
+            let method = method_value.as_obj().expect("Expected method closure");
             return self.call(method, arg_count);
         }
         self.runtime_error(&format!("Undefined property: {}", method_name));
@@ -1089,7 +1096,10 @@ impl Vm {
                         self.stack.push(result);
                         true
                     },
-                    _ => false
+                    _ => {
+                        self.runtime_error("Can only call functions and classes.");
+                        false
+                    }
                 }
             },
             _ => {
@@ -1112,7 +1122,10 @@ impl Vm {
             return false;
         }
 
-        // NOTE: I AVOIDED CHECKING ON THE MAXIMUM STACK FRAMES SIZE
+        if self.frames.len() == 64 {
+            self.runtime_error("Stack overflow.");
+            return false;
+        }
 
         let frame = CallFrame {
             //function: obj_ref,

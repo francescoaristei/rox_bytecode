@@ -30,14 +30,15 @@ impl Value {
                 match heap.get(*obj_ref) {
                     HeapObj::String(string) => print!("{}", string.chars),
                     HeapObj::Function(func) => { self.display_function(func.name, heap) },
-                    HeapObj::NativeFunction(native_func) => { self.display_function(native_func.name, heap) },
+                    HeapObj::NativeFunction(_) => { print!("<native fn>") },
                     HeapObj::Closure(closure) => { self.display_closure(&closure.obj_function, heap) },
                     HeapObj::Upvalue(_) => print!("upvalue"),
                     HeapObj::Class(class) => { self.display_class(class.name, heap) },
                     HeapObj::Instance(instance) => { self.display_instance(instance.klass, heap) },
                     HeapObj::BoundMethod(bound_method) => {
-                        let closure = heap.get(bound_method.method).as_closure();
-                        self.display_function(Option::from(closure.obj_function), heap);
+                        // bound_method.method is a closure; display_closure gets its name via the function object
+                        let func_ref = heap.get(bound_method.method).as_closure().obj_function;
+                        self.display_closure(&func_ref, heap);
                     }
                 }
             },
