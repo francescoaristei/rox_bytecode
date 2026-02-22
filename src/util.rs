@@ -71,12 +71,12 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &mut usize, heap: &Heap) -
         Some(OpCode::OpLoop) => jump_instruction("OP_LOOP", -1, chunk, offset),
         Some(OpCode::OpCall) => byte_instruction("OP_CALL", chunk, offset),
         Some(OpCode::OpClosure) => {
-            *offset = *offset + 1;
+            *offset += 1;
             let constant = chunk.get_code()[*offset] as usize;
-            *offset = *offset + 1;
+            *offset += 1;
             print!("    {:16} {:4}", "OP_CLOSURE", constant);
             chunk.get_constants().get_value(constant).print_value(heap);
-            print!("\n");
+            println!();
             match chunk.get_constants().get_value(constant) {
                 Value::Obj(obj_ref) => {
                     let obj_function = heap.get(*obj_ref).as_function();
@@ -104,6 +104,9 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &mut usize, heap: &Heap) -
         Some(OpCode::OpSetProperty) => constant_instruction("OP_SET_PROPERTY", chunk, offset, heap),
         Some(OpCode::OpMethod) => constant_instruction("OP_METHOD", chunk, offset, heap),
         Some(OpCode::OpInvoke) => invoke_instruction("OP_INVOKE", chunk, offset, heap),
+        Some(OpCode::OpInherit) => simple_instruction("OP_INHERIT", offset),
+        Some(OpCode::OpGetSuper) => constant_instruction("OP_GET_SUPER", chunk, offset, heap),
+        Some(OpCode::OpSuperInvoke) => invoke_instruction("OP_SUPER_INVOKE", chunk, offset, heap),
         None => {
             println!("Unknown opcode: {}", byte);
             *offset + 1
@@ -113,10 +116,10 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: &mut usize, heap: &Heap) -
 
 fn jump_instruction(name: &str, sign: i32, chunk: &Chunk, offset: &usize) -> usize {
     let mut jump = (chunk.get_code()[offset + 1] as u16) << 8;
-    jump = jump | chunk.get_code()[offset + 2] as u16;
+    jump |= chunk.get_code()[offset + 2] as u16;
     let target = (*offset as i32) + 3 + sign * (jump as i32);
     print!("    {:16} {:4} -> {}", name, offset, target);
-    print!("\n");
+    println!();
     *offset + 3
 }
 
@@ -124,7 +127,7 @@ fn byte_instruction(name: &str, chunk: &Chunk, offset: &usize) -> usize {
     // local variables never leave the compiler to make it to the chunk therefore we show only the slot
     let slot = chunk.get_code()[offset + 1];
     print!("    {:16} {:4}  ", name, slot);
-    print!("\n");
+    println!();
     *offset + 2
 }
 
@@ -132,7 +135,7 @@ fn constant_instruction(name: &str, chunk: &Chunk, offset: &usize, heap: &Heap) 
     let constant_index = chunk.get_code()[*offset + 1] as usize;
     print!("    {:16} {:4}  ", name, constant_index);
     chunk.get_constants().get_value(constant_index).print_value(heap);
-    print!("\n");
+    println!();
     *offset + 2
 }
 
@@ -141,7 +144,7 @@ fn invoke_instruction(name: &str, chunk: &Chunk, offset: &usize, heap: &Heap) ->
     let arg_count = chunk.get_code()[*offset + 2];
     print!("    {:16} ({} args) {:4}  ", name, arg_count, constant_index);
     chunk.get_constants().get_value(constant_index).print_value(heap);
-    print!("\n");
+    println!();
     *offset + 3
 }
 

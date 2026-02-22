@@ -46,11 +46,8 @@ impl Value {
     }
     
     fn display_class(&self, obj_ref:Option<ObjRef>, heap: &Heap) {
-        match obj_ref { 
-            Some(obj_ref) => {
-                print!("{}", heap.get(obj_ref).as_string().chars)
-            },
-            None => {}
+        if let Some(obj_ref) = obj_ref {
+            print!("{}", heap.get(obj_ref).as_string().chars)
         }
     }
 
@@ -116,6 +113,12 @@ impl Value {
 
 pub struct Values {
     values: Vec<Value>
+}
+
+impl Default for Values {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Values {

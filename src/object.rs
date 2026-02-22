@@ -27,6 +27,12 @@ pub struct ObjFunction {
     pub upvalue_count: usize
 }
 
+impl Default for ObjFunction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ObjFunction {
     pub fn new() -> Self {
         ObjFunction {

@@ -1,4 +1,3 @@
-use crate::chunk::OpCode::OpCall;
 use crate::value::{Value, Values};
 
 /*
@@ -45,7 +44,12 @@ pub enum OpCode {
     OpSetProperty = 30,
     OpGetProperty = 31,
     OpMethod = 32,
-    OpInvoke = 33
+    OpInvoke = 33,
+    OpInherit = 34,
+    // Looks up a method by name in the superclass and creates a bound method with `this` as receiver.
+    OpGetSuper = 35,
+    // Optimization: superclass method lookup + call in one instruction (avoids allocating a bound method).
+    OpSuperInvoke = 36
 }
 
 impl OpCode {
@@ -85,6 +89,9 @@ impl OpCode {
             31 => Some(OpCode::OpGetProperty),
             32 => Some(OpCode::OpMethod),
             33 => Some(OpCode::OpInvoke),
+            34 => Some(OpCode::OpInherit),
+            35 => Some(OpCode::OpGetSuper),
+            36 => Some(OpCode::OpSuperInvoke),
             _ => None
         }
     }
@@ -102,6 +109,12 @@ pub struct Chunk {
     code: Vec<u8>,
     lines: Vec<usize>, // to store the line number to return in case of runtime error, it parallels the code array
     constants: Values
+}
+
+impl Default for Chunk {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Chunk {

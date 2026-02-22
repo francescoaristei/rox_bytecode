@@ -138,6 +138,12 @@ enum ArithmeticOps {
     Less
 }
 
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Vm {
     pub fn new() -> Self {
         Vm {
@@ -237,6 +243,68 @@ impl Vm {
             // opcode of the bytecode instruction is read to understand what to do, process called 'dispatching'
             let instruction: u8 = self.read_byte();
             match OpCode::from_u8(instruction) {
+                Some(OpCode::OpInherit) => {
+                    /*
+                    * When method x of the superclass is called in the subclass how is it retrieved?
+                    * The idea is that instead of searching through the path of all the inheritances
+                    * until the superclass where method x is defined, all the superclass methods are directly
+                    * copied into the subclass to make them available directly there, without having to search.
+                    * This mantains overriding because it happens before the methods of the subclass are assigned to it
+                    * therefore if a method named 'x' is also defined in the subclass, it will substitute in the hashmap
+                    * method x of the superclass.
+                     */
+                    let superclass_ref = self.peek(1).as_obj().expect("Expect superclass ref");
+                    if !self.heap.get(superclass_ref).is_class() {
+                        self.runtime_error("Superclass must be a class");
+                        return Err(InterpretRuntimeError);
+                    }
+                    let subclass_ref = self.peek(0).as_obj().expect("Expect subclass ref");
+                    let superclass_methods = self.heap.get(superclass_ref).as_class().methods.clone(); // cloning of obj_refs
+                    let subclass = self.heap.get_mut(subclass_ref).as_mut_class();
+                    for (key, value) in superclass_methods {
+                        subclass.methods.insert(key, value);
+                    }
+                    // Pop the subclass — it was only needed for the method copy above.
+                    // The superclass remains on the stack as the value of the 'super' local.
+                    self.stack.pop();
+                },
+                Some(OpCode::OpGetSuper) => {
+                    let method_name_ref = self.read_constant().as_obj().unwrap();
+                    // Pop 'super' (the superclass); 'this' is now on top of the stack.
+                    let superclass_ref = self.stack.pop().unwrap().as_obj().expect("Expect superclass");
+                    /*
+                    * Even though the method was already copied into the subclass via OpInherit,
+                    * we intentionally look it up in the superclass: 'super.method()' forces the
+                    * lookup to start at the superclass, bypassing any override in the subclass.
+                    * Without this, 'super.bark()' inside Dog.bark would find Dog's own 'bark' and recurse infinitely.
+                    *
+                    * bind_method wraps the found closure together with 'this' (the Dog instance)
+                    * into an ObjBoundMethod. This is required because when OpCall later calls the
+                    * bound method, call_value writes bound_method.receiver into stack[slot0] of the
+                    * new call frame — making 'this' inside Animal.bark resolve to the Dog instance.
+                    * If the raw closure were pushed instead, the Closure branch of call_value would
+                    * be hit, slot 0 would not be set, and 'this' would point to the wrong object.
+                    */
+                    if !self.bind_method(superclass_ref, method_name_ref) {
+                        return Err(InterpretRuntimeError);
+                    }
+                },
+                Some(OpCode::OpSuperInvoke) => {
+                    let method_name_ref = self.read_constant().as_obj().unwrap();
+                    let arg_count = self.read_byte();
+                    // Pop 'super'; 'this' sits below the arguments at peek(arg_count).
+                    let superclass_ref = self.stack.pop().unwrap().as_obj().expect("Expect superclass");
+                    /*
+                    * Same superclass-forced lookup as OpGetSuper, but combined with the call in a
+                    * single instruction — no ObjBoundMethod is allocated.
+                    * invoke_from_class calls self.call(closure, arg_count), which sets
+                    * slots = stack.len() - arg_count - 1, placing 'this' at slot 0 of the new
+                    * frame automatically because 'this' was pushed before the arguments.
+                    */
+                    if !self.invoke_from_class(superclass_ref, method_name_ref, arg_count) {
+                        return Err(InterpretRuntimeError);
+                    }
+                },
                 Some(OpCode::OpInvoke) => {
                     let method = self.read_constant().as_obj().expect("Expected method");
                     let arg_count = self.read_byte();
@@ -369,7 +437,7 @@ impl Vm {
                     }
                 }
                 Some(OpCode::OpClosure) => {
-                    let constant = self.read_constant().clone();
+                    let constant = *self.read_constant();
                     match constant {
                         Obj(obj_ref) => {
                             let upvalue_count = self.heap.get(obj_ref).as_function().upvalue_count;
@@ -579,7 +647,7 @@ impl Vm {
                     }
                 },
                 Some(OpCode::OpConstant) => {
-                    let constant = self.read_constant().clone();
+                    let constant = *self.read_constant();
                     self.stack.push(constant);
                 },
                 Some(OpCode::OpFalse) => self.stack.push(Value::Boolean(false)),
@@ -600,7 +668,7 @@ impl Vm {
                      */
                     if let Some(stack_value) = self.stack.pop() {
                         stack_value.print_value(&self.heap);
-                        print!("\n");
+                        println!();
                     } else {
                         return Err(self.runtime_error("No value on the stack."))
                     }
@@ -630,7 +698,7 @@ impl Vm {
                     let slot = self.read_byte();
                     // the local variable in the call frame is at the position given by the beginning of the
                     // call frame in the stack (frame.slots) + the relative position inside the call frame (slot)
-                    self.stack.push(self.stack[frame.slots + slot as usize].clone())
+                    self.stack.push(self.stack[frame.slots + slot as usize])
                 },
                 Some(OpCode::OpDefineGlobal) => {
                     let constant = self.read_constant();
@@ -646,7 +714,7 @@ impl Vm {
                     let constant = self.read_constant();
                     match constant {
                         Obj(obj_ref) => {
-                            if self.globals.get(&obj_ref).is_none() {
+                            if self.globals.get(obj_ref).is_none() {
                                 // in cases like:
                                 // variable1 = "something"
                                 // where variable1 has never been defined before e.g never done: var variable1;
@@ -666,13 +734,13 @@ impl Vm {
                     let last = self.frames.len() - 1;
                     let frame = &self.frames[last];
                     let slot = self.read_byte();
-                    self.stack[frame.slots + slot as usize] = self.peek(0).clone();
+                    self.stack[frame.slots + slot as usize] = *self.peek(0);
                 },
                 Some(OpCode::OpJumpIfFalse) => {
                     let offset = self.read_short();
                     // if the if condition is false, the ip is updated to proceed to the next instruction
                     // after the then_branch
-                    if self.is_falsey(self.peek(0).clone()) {
+                    if self.is_falsey(*self.peek(0)) {
                         let frame = self.current_frame();
                         frame.ip.set(frame.ip.get() + offset as usize);
                     }

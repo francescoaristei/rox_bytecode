@@ -131,7 +131,11 @@ impl<'a> Local<'a> {
 *
 * Will hold has_superclass: bool once inheritance is implemented (Chapter 29).
 */
-struct ClassCompiler {}
+struct ClassCompiler {
+    // True if the class being compiled has a superclass (`class Foo < Bar`).
+    // Used to validate `super` usage and to know whether to close the `super` scope.
+    has_superclass: bool
+}
 
 struct Compiler<'a> {
     /*
@@ -194,14 +198,13 @@ impl<'a> Compiler<'a> {
      */
     fn resolve_local(&self, name: &str) -> Result<Option<u8>, ()> {
         for i in (0..self.local_count).rev() {
-            if let Some(local) = self.locals.get(i as usize) {
-                if local.name.get_lexeme() == name {
+            if let Some(local) = self.locals.get(i as usize)
+                && local.name.get_lexeme() == name {
                     if local.depth.is_none() {
                         return Err(()); // signal error: can't read in own initializer
                     }
                     return Ok(Some(i));
                 }
-            }
         }
         Ok(None)
     }
@@ -372,7 +375,7 @@ impl<'a> Parser<'a> {
         rules_map.insert(TokenType::Or, ParseRule::new(None, Some(Parser::or), Precedence::PrecedenceOr));
         rules_map.insert(TokenType::Print, ParseRule::new(None, None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Return, ParseRule::new(None, None, Precedence::PrecedenceNone));
-        rules_map.insert(TokenType::Super, ParseRule::new(None, None, Precedence::PrecedenceNone));
+        rules_map.insert(TokenType::Super, ParseRule::new(Some(Parser::super_), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::This, ParseRule::new(Some(Parser::this), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::True, ParseRule::new(Some(Parser::literal), None, Precedence::PrecedenceNone));
         rules_map.insert(TokenType::Var, ParseRule::new(None, None, Precedence::PrecedenceNone));
@@ -424,8 +427,12 @@ impl<'a> Parser<'a> {
     fn class_declaration(&mut self) {
         // Push a ClassCompiler so that 'this' (and later 'super') know they are inside
         // a valid class body for the duration of compiling this class's methods.
-        self.class_compilers.push(ClassCompiler {});
+        self.class_compilers.push(ClassCompiler { has_superclass: false });
         self.consume(TokenType::Identifier, "Expect class name.");
+
+        // save class name
+        let name = self.previous.get_lexeme();
+
         // the class name identifier is added to the surrounding function's constant table
         // indeed printing a class means printing its name therefore the compilers needs to put this name
         // somewhere for the runtime to find it
@@ -448,13 +455,58 @@ impl<'a> Parser<'a> {
          */
         self.define_variable(name_constant);
 
+        /*
+        * The class name has been compiled.
+        * We encounter a '<' , the superclass token is also consumed.
+        * Then self.variable() is called, which takes the previously consumed token
+        * treats it as a variable reference and emits code to load the variable value:
+        * basically it takes the superclass by name and loads it onto the stack.
+        * self.named_variable() loads the subclass to do the inheriting on the stack:
+        * OP_INHERIT works like OP_METHOD -> it modifies a class in this case to make it
+        * inherit from the superclass.
+        *
+         */
+        if self.match_token_type(TokenType::Less) {
+            self.consume(TokenType::Identifier, "Expect superclass name");
+
+            // Pushes the superclass value onto the stack by resolving it as a variable.
+            self.variable(false);
+            let superclass_name = self.previous.get_lexeme();
+
+            if name == superclass_name {
+                self.error("A class cannot inherit from itself")
+            }
+
+            /*
+            * Open a new scope and declare 'super' as a local variable.
+            * add_local() does not push anything — it simply claims the stack slot that
+            * variable(false) just filled (the superclass value) and names it "super".
+            * mark_initialized() immediately marks it usable (depth = Some(scope_depth))
+            * so the compiler does not treat it as an uninitialized variable.
+            *
+            * Any method inside this class that references 'super' will have the compiler
+            * resolve it through the normal upvalue mechanism: resolve_upvalues() walks the
+            * enclosing compiler chain, finds 'super' as a local here, and captures it.
+            * At runtime, each closure gets a copy of the ObjRef to the superclass via its
+            * upvalue array, so 'super' remains accessible even after the class declaration
+            * has finished executing.
+            */
+            self.begin_scope();
+            self.add_local(Token::new("super"));
+            self.mark_initialized();
+
+            self.named_variable(name, false); // loads the subclass for OP_INHERIT
+            self.emit_byte(OpCode::OpInherit.to_u8());
+            self.class_compilers.last_mut().unwrap().has_superclass = true;
+        }
+
         // necessary to put the name of the class at the top of the stack before
         // starting the method declaration, otherwise the methods are not able to locate the class
         // when binding to it: it could be on the stack somewhere as local variable or on the globals
         // in case is a top-level declaration class.
         // basically while compiling the methods, these will be on the top of the stack right on top of the
         // class name
-        self.named_variable(false);
+        self.named_variable(name, false);
 
         self.consume(TokenType::LeftBrace, "Expect '{' before class body");
 
@@ -473,6 +525,13 @@ impl<'a> Parser<'a> {
         }
 
         self.consume(TokenType::RightBrace, "Expect '}', after class body");
+
+        // Close the 'super' scope if one was opened, emitting OpCloseUpvalue so that
+        // any method closure that captured 'super' as an upvalue keeps a valid reference
+        // to the superclass after the stack slot is gone.
+        if self.class_compilers.last().map(|cc| cc.has_superclass).unwrap_or(false) {
+            self.end_scope();
+        }
 
         // Class body is fully compiled; restore the enclosing class context (or none).
         self.class_compilers.pop();
@@ -1108,14 +1167,15 @@ impl<'a> Parser<'a> {
     }
 
     fn variable(&mut self, can_assign: bool) {
-        self.named_variable(can_assign);
+        let variable_name = self.previous.get_lexeme();
+        self.named_variable(variable_name, can_assign);
     }
 
-    fn named_variable(&mut self, can_assign: bool) {
+    fn named_variable(&mut self, name: &str, can_assign: bool) {
         let get_op: u8;
         let set_op: u8;
 
-        let name = self.previous.get_lexeme().to_string();
+        //let name = self.previous.get_lexeme().to_string();
         let mut arg = match self.compiler.resolve_local(&name) {
             Ok(result) => result,
             Err(()) => {
@@ -1251,6 +1311,49 @@ impl<'a> Parser<'a> {
             return;
         }
         self.variable(false);
+    }
+
+    /*
+    * Compiles a `super.method` or `super.method(args)` expression.
+    *
+    * Stack layout produced before the opcode is emitted:
+    *   [ this (receiver) ]  [ args... ]  [ super (superclass) ]
+    *
+    * 'this' is pushed first so the method can be bound to the correct instance.
+    * 'super' is pushed last so the VM knows which class to search for the method.
+    *
+    * If a '(' immediately follows the method name, the OpSuperInvoke optimization is
+    * used: arguments are compiled between 'this' and 'super', and the VM performs the
+    * lookup and call in a single instruction without allocating a bound method object.
+    * Otherwise, OpGetSuper looks up the method in the superclass and leaves a bound
+    * method on the stack for a subsequent OpCall.
+    */
+    fn super_(&mut self, can_assign: bool) {
+        if self.class_compilers.is_empty() {
+            self.error("Can't use 'super' outside of a class.");
+        } else if !self.class_compilers.last().unwrap().has_superclass {
+            self.error("Can't use 'super' in a class with no superclass.");
+        }
+
+        self.consume(TokenType::Dot, "Expect '.' after 'super'.");
+        self.consume(TokenType::Identifier, "Expect superclass method name.");
+        // intern the method name and store it in the constant pool
+        let method_name = self.identifier_constant();
+
+        // 'this' is the instance the looked-up method will be bound to
+        self.named_variable("this", false);
+
+        if self.match_token_type(TokenType::LeftParen) {
+            // OpSuperInvoke path: compile args, then load 'super', emit combined op
+            let arg_count = self.argument_list();
+            self.named_variable("super", false);
+            self.emit_bytes(OpCode::OpSuperInvoke.to_u8(), method_name);
+            self.emit_byte(arg_count);
+        } else {
+            // OpGetSuper path: load 'super', emit lookup — leaves a bound method on stack
+            self.named_variable("super", false);
+            self.emit_bytes(OpCode::OpGetSuper.to_u8(), method_name);
+        }
     }
 
     /*
@@ -1552,7 +1655,7 @@ impl<'a> Parser<'a> {
       OP_MULTIPLY       // 2 * 3 = 6
       OP_ADD            // 1 + 6 = 7
 
-      This correctly evaluates as 1 + (2 * 3) = 7 ✅
+      This correctly evaluates as 1 + (2 * 3) = 7
 
       ---
       The Magic of precedence + 1

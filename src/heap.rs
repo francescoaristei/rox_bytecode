@@ -105,6 +105,13 @@ impl HeapObj {
         }
     }
 
+    pub fn is_class(&self) -> bool {
+        match self {
+            HeapObj::Class(_) => true,
+            _ => false
+        }
+    }
+
     // for instances is required to cover the case in which a user
     // tries to access a property on a non-instance e.g a string etc.
     pub fn try_as_instance(&self) -> Option<&ObjInstance> {
@@ -194,6 +201,12 @@ pub struct Heap {
     next_gc: usize
 }
 
+impl Default for Heap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Heap {
     pub fn new() -> Self {
         Heap {
@@ -210,7 +223,7 @@ impl Heap {
     pub fn alloc(&mut self, obj: HeapObj) -> ObjRef {
         // increment bytes allocated
         let size = size_of_val(&obj);
-        self.bytes_allocated = self.bytes_allocated + size;
+        self.bytes_allocated += size;
 
         let index = if let Some(free) = self.free_slots.pop() {
             self.objects[free] = Some(obj);
@@ -353,13 +366,11 @@ impl Heap {
         for i in 0..self.marked_objs.len() {
             if self.marked_objs[i] {
                 self.marked_objs[i] = false;
-            } else {
-                if self.objects[i].is_some() {
-                    let size = size_of_val(&self.objects[i]);
-                    self.bytes_allocated = self.bytes_allocated - size;
-                    self.objects[i] = None;
-                    self.free_slots.push(i)
-                }
+            } else if self.objects[i].is_some() {
+                let size = size_of_val(&self.objects[i]);
+                self.bytes_allocated -= size;
+                self.objects[i] = None;
+                self.free_slots.push(i)
             }
         }
     }
